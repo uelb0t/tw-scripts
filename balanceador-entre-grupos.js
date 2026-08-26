@@ -87,13 +87,19 @@
   }
 
   // ------------------------- LEITURA DA VISÃO GERAL (PRODUÇÃO) -------------------------
-  // A tela "Produção" tem: Aldeia | Pontos | Recursos (3 juntos) | Armazém | Comerciantes | Fazenda | ...
-  // Detecta as colunas pelo cabeçalho (PT/EN).
-  function headerMap(table) {
+  // Encontra a linha de cabeçalho da tabela de aldeias (a que tem "Recursos" e
+  // "Armazém") e mapeia as colunas — independe de id/estrutura da tabela.
+  function findHeaderMap(doc) {
+    const trs = [...doc.querySelectorAll("tr")];
+    let headerRow = null;
+    for (const tr of trs) {
+      const t = (tr.textContent || "").toLowerCase();
+      if (/recurso|resource/.test(t) && /armaz|warehouse|storage/.test(t) && tr.querySelector("th,td")) { headerRow = tr; break; }
+    }
     const map = {};
-    const ths = table.querySelectorAll("thead th, tr:first-child th");
-    ths.forEach((th, i) => {
-      const t = (th.textContent || "").toLowerCase();
+    if (!headerRow) return map;
+    [...headerRow.children].forEach((c, i) => {
+      const t = (c.textContent || "").toLowerCase();
       if (/pont|point/.test(t)) map.points = i;
       if (/recurso|resource/.test(t)) map.res = i;                       // coluna única com os 3 recursos
       if (/armaz|warehouse|capac|storage/.test(t)) map.storage = i;
@@ -113,16 +119,19 @@
     return { wood: nums[0], stone: nums[1], iron: nums[2] };
   }
   function readRes(tr, map) {
-    // 1) coluna única "Recursos"
+    // 1) por classe .res.wood/.stone/.iron (layout real da tela Produção do br142)
+    const woodEl = tr.querySelector("span.wood, .res.wood");
+    const stoneEl = tr.querySelector("span.stone, .res.stone");
+    const ironEl = tr.querySelector("span.iron, .res.iron");
+    if (woodEl && stoneEl && ironEl) {
+      return { wood: num(woodEl.textContent), stone: num(stoneEl.textContent), iron: num(ironEl.textContent) };
+    }
+    // 2) coluna única "Recursos" com 3 números
     if (map.res != null && tr.children[map.res]) {
       const r = threeNums(tr.children[map.res].textContent);
       if (r) return r;
     }
-    // 2) por classe (alguns temas)
-    const byClass = k => { const el = tr.querySelector("span." + k + ", ." + k + " ~ *"); return el ? num(el.textContent) : null; };
-    let w = byClass("wood"), c = byClass("stone"), i = byClass("iron");
-    if (w && c && i) return { wood: w, stone: c, iron: i };
-    // 3) colunas separadas
+    // 3) colunas separadas por índice
     if (map.wood != null && map.stone != null && map.iron != null) {
       return { wood: num(tr.children[map.wood].textContent), stone: num(tr.children[map.stone].textContent), iron: num(tr.children[map.iron].textContent) };
     }
@@ -142,35 +151,31 @@
 
   async function readGroup(gid) {
     const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&group=" + gid + "&page=-1");
-    const table = doc.querySelector("#production_table") || doc.querySelector("table.overview_table") || doc.querySelector("#content_value table") || doc.querySelector("table");
-    if (!table) return { villages: [], missing: ["tabela"] };
-    const map = headerMap(table);
-    const rows = table.querySelectorAll("tbody tr");
+    const map = findHeaderMap(doc);
+    // linhas de aldeia = qualquer <tr> com link de aldeia E uma coordenada
+    const rows = [...doc.querySelectorAll("tr")].filter(tr =>
+      tr.querySelector('a[href*="village="]') && /\d{1,3}\|\d{1,3}/.test(tr.textContent || ""));
     const villages = [];
     const missing = new Set();
+    if (map.res == null && !(map.wood != null && map.stone != null && map.iron != null)) missing.add("recursos");
+    if (map.storage == null) missing.add("armazém");
+    if (map.merchants == null) missing.add("mercadores");
     rows.forEach(tr => {
       const link = tr.querySelector('a[href*="village="]');
-      if (!link) return;
       const idm = link.href.match(/village=(\d+)/);
-      if (!idm) return;
-      // coords: procura na célula inteira da aldeia (não só no link)
-      const cellText = (tr.children[0] ? tr.children[0].textContent : link.textContent) || "";
-      const mm = cellText.match(/(\d{1,3})\|(\d{1,3})/);
-      if (!mm) return;
+      const mm = (tr.textContent || "").match(/(\d{1,3})\|(\d{1,3})/);
+      if (!idm || !mm) return;
       const v = {
         id: +idm[1],
-        name: (link.textContent || "").replace(/\s*\(\d+\|\d+\).*/, "").trim() || (link.textContent || "").trim(),
+        name: (link.textContent || "").trim().replace(/\s*\(\d+\|\d+\).*/, "") || (link.textContent || "").trim(),
         x: +mm[1], y: +mm[2]
       };
       v.points = (map.points != null && tr.children[map.points]) ? num(tr.children[map.points].textContent) : 0;
       const res = readRes(tr, map);
-      if (!res) { missing.add("recursos"); v.wood = v.stone = v.iron = 0; }
-      else { v.wood = res.wood; v.stone = res.stone; v.iron = res.iron; }
-      const st = readStorage(tr, map);
-      if (st == null) missing.add("armazém");
-      v.storage = st || 0;
+      if (res) { v.wood = res.wood; v.stone = res.stone; v.iron = res.iron; }
+      else { v.wood = v.stone = v.iron = 0; }
+      v.storage = readStorage(tr, map) || 0;
       const me = readMerchants(tr, map);
-      if (me == null) missing.add("mercadores");
       v.merchants = me == null ? 0 : me;
       villages.push(v);
     });
