@@ -46,10 +46,22 @@
 
   // ------------------------- GRUPOS -------------------------
   async function loadGroups() {
-    // Método 1 (mais confiável): lê o seletor de grupos na Visão Geral.
+    // Método 1 (novo layout): grupos aparecem como LINKS no topo da visão geral.
     try {
-      const doc = await fetchDoc("/game.php?screen=overview_villages&mode=combined&page=-1");
-      const sel = doc.querySelector('#group_id, select[name="group_id"], select.group-select, #grouptable select');
+      const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&page=-1");
+      const seen = {}, out = [];
+      doc.querySelectorAll('a[href*="group="]').forEach(a => {
+        const m = a.href.match(/[?&]group=(\d+)/);
+        if (!m) return;
+        const id = m[1];
+        if (id === "0" || seen[id]) return;
+        const name = (a.textContent || "").replace(/[\[\]<>]/g, "").trim();
+        if (!name) return;
+        seen[id] = 1; out.push({ id, name });
+      });
+      if (out.length) return out;
+      // fallback: seletor <select> (layout antigo)
+      const sel = doc.querySelector('#group_id, select[name="group_id"], select.group-select');
       if (sel) {
         const opts = [...sel.querySelectorAll("option")]
           .map(o => ({ id: String(o.value).trim(), name: (o.textContent || "").trim() }))
@@ -74,51 +86,63 @@
     return [];
   }
 
-  // ------------------------- LEITURA DA VISÃO GERAL -------------------------
-  // Usa a visão geral "combined" (recursos + armazém + mercadores + pontos).
-  // Detecta as colunas pelo cabeçalho (PT/EN) para ser robusto a temas/idiomas.
+  // ------------------------- LEITURA DA VISÃO GERAL (PRODUÇÃO) -------------------------
+  // A tela "Produção" tem: Aldeia | Pontos | Recursos (3 juntos) | Armazém | Comerciantes | Fazenda | ...
+  // Detecta as colunas pelo cabeçalho (PT/EN).
   function headerMap(table) {
     const map = {};
-    const ths = table.querySelectorAll("thead th");
+    const ths = table.querySelectorAll("thead th, tr:first-child th");
     ths.forEach((th, i) => {
       const t = (th.textContent || "").toLowerCase();
       if (/pont|point/.test(t)) map.points = i;
+      if (/recurso|resource/.test(t)) map.res = i;                       // coluna única com os 3 recursos
       if (/armaz|warehouse|capac|storage/.test(t)) map.storage = i;
-      if (/mercador|merchant|trader/.test(t)) map.merchants = i;
-      if (/madeira|wood|lenh/.test(t)) map.wood = i;
-      if (/argila|barro|clay|stone/.test(t)) map.stone = i;
+      if (/comerciante|mercador|merchant|trader/.test(t)) map.merchants = i;
+      if (/madeira|wood|lenh/.test(t)) map.wood = i;                     // (layouts com colunas separadas)
+      if (/argila|barro|clay/.test(t)) map.stone = i;
       if (/ferro|iron/.test(t)) map.iron = i;
     });
     return map;
   }
-  function readResFromRow(tr) {
-    // 1) tenta por classe (padrão comum das visões gerais)
-    const byClass = k => { const el = tr.querySelector("." + k + ", .res." + k + ", span." + k); return el ? num(el.textContent) : null; };
+  // extrai os 3 primeiros números de um texto (madeira, argila, ferro), aceitando "80.928"
+  function threeNums(txt) {
+    const m = (txt || "").match(/\d[\d.,]*\d|\d/g);
+    if (!m) return null;
+    const nums = m.map(num).filter(n => !isNaN(n));
+    if (nums.length < 3) return null;
+    return { wood: nums[0], stone: nums[1], iron: nums[2] };
+  }
+  function readRes(tr, map) {
+    // 1) coluna única "Recursos"
+    if (map.res != null && tr.children[map.res]) {
+      const r = threeNums(tr.children[map.res].textContent);
+      if (r) return r;
+    }
+    // 2) por classe (alguns temas)
+    const byClass = k => { const el = tr.querySelector("span." + k + ", ." + k + " ~ *"); return el ? num(el.textContent) : null; };
     let w = byClass("wood"), c = byClass("stone"), i = byClass("iron");
-    if (w != null && c != null && i != null) return { wood: w, stone: c, iron: i };
-    return null; // deixa o chamador tentar por índice de coluna
+    if (w && c && i) return { wood: w, stone: c, iron: i };
+    // 3) colunas separadas
+    if (map.wood != null && map.stone != null && map.iron != null) {
+      return { wood: num(tr.children[map.wood].textContent), stone: num(tr.children[map.stone].textContent), iron: num(tr.children[map.iron].textContent) };
+    }
+    return null;
   }
   function readStorage(tr, map) {
-    if (map.storage == null) return null;
-    const cell = tr.children[map.storage];
-    if (!cell) return null;
-    const val = num(cell.textContent);
-    // se o valor for pequeno, provavelmente é o NÍVEL do armazém → converte
-    if (val > 0 && val <= 30 && WH_CAP[val]) return WH_CAP[val];
+    if (map.storage == null || !tr.children[map.storage]) return null;
+    const val = num(tr.children[map.storage].textContent);
+    if (val > 0 && val <= 30 && WH_CAP[val]) return WH_CAP[val]; // caso mostre o nível
     return val || null;
   }
   function readMerchants(tr, map) {
-    if (map.merchants == null) return null;
-    const cell = tr.children[map.merchants];
-    if (!cell) return null;
-    // formato "disponíveis/total" → pega o primeiro número (disponíveis)
-    const m = (cell.textContent || "").match(/(\d[\d.]*)/);
+    if (map.merchants == null || !tr.children[map.merchants]) return null;
+    const m = (tr.children[map.merchants].textContent || "").match(/(\d[\d.]*)/); // "66/110" -> 66
     return m ? num(m[1]) : 0;
   }
 
   async function readGroup(gid) {
-    const doc = await fetchDoc("/game.php?screen=overview_villages&mode=combined&group=" + gid + "&page=-1");
-    const table = doc.querySelector("#combined_table") || doc.querySelector("table.overview_table") || doc.querySelector("table");
+    const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&group=" + gid + "&page=-1");
+    const table = doc.querySelector("#production_table") || doc.querySelector("table.overview_table") || doc.querySelector("#content_value table") || doc.querySelector("table");
     if (!table) return { villages: [], missing: ["tabela"] };
     const map = headerMap(table);
     const rows = table.querySelectorAll("tbody tr");
@@ -127,29 +151,27 @@
     rows.forEach(tr => {
       const link = tr.querySelector('a[href*="village="]');
       if (!link) return;
-      const mm = link.textContent.match(/(\d{1,3})\|(\d{1,3})/);
       const idm = link.href.match(/village=(\d+)/);
-      if (!mm || !idm) return;
+      if (!idm) return;
+      // coords: procura na célula inteira da aldeia (não só no link)
+      const cellText = (tr.children[0] ? tr.children[0].textContent : link.textContent) || "";
+      const mm = cellText.match(/(\d{1,3})\|(\d{1,3})/);
+      if (!mm) return;
       const v = {
         id: +idm[1],
-        name: link.textContent.replace(/\s*\(\d+\|\d+\).*/, "").trim(),
+        name: (link.textContent || "").replace(/\s*\(\d+\|\d+\).*/, "").trim() || (link.textContent || "").trim(),
         x: +mm[1], y: +mm[2]
       };
-      // pontos
       v.points = (map.points != null && tr.children[map.points]) ? num(tr.children[map.points].textContent) : 0;
-      // recursos
-      let res = readResFromRow(tr);
-      if (!res && map.wood != null && map.stone != null && map.iron != null) {
-        res = { wood: num(tr.children[map.wood].textContent), stone: num(tr.children[map.stone].textContent), iron: num(tr.children[map.iron].textContent) };
-      }
-      if (!res) { missing.add("recursos"); res = { wood: 0, stone: 0, iron: 0 }; }
-      v.wood = res.wood; v.stone = res.stone; v.iron = res.iron;
-      // armazém
+      const res = readRes(tr, map);
+      if (!res) { missing.add("recursos"); v.wood = v.stone = v.iron = 0; }
+      else { v.wood = res.wood; v.stone = res.stone; v.iron = res.iron; }
       const st = readStorage(tr, map);
-      if (st == null) missing.add("armazém"); v.storage = st || 0;
-      // mercadores
+      if (st == null) missing.add("armazém");
+      v.storage = st || 0;
       const me = readMerchants(tr, map);
-      if (me == null) missing.add("mercadores"); v.merchants = me == null ? 0 : me;
+      if (me == null) missing.add("mercadores");
+      v.merchants = me == null ? 0 : me;
       villages.push(v);
     });
     return { villages, missing: [...missing] };
@@ -273,10 +295,40 @@
   }
 
   // ---- Tela 2: plano de envios ----
-  function sendUrl(s) {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  function sendUrl(s) { // fallback (abre a praça preenchida)
     return origin + "/game.php?village=" + s.src.id + "&screen=market&mode=send&target=" + s.dst.id +
       "&wood=" + (s.wood || 0) + "&stone=" + (s.stone || 0) + "&iron=" + (s.iron || 0);
   }
+  // ENVIO REAL: usa o endpoint de envio de recursos do jogo (map_send), no
+  // contexto da aldeia de origem, com o token de sessão (csrf).
+  async function doSend(s, statusEl) {
+    statusEl.textContent = "enviando…"; statusEl.style.color = "#e8d9a0";
+    const gd = window.game_data || {};
+    const csrf = gd.csrf || window.csrf_token || "";
+    const url = origin + "/game.php?village=" + s.src.id + "&screen=market&mode=send&ajax=map_send" + (csrf ? "&h=" + csrf : "");
+    const body = new URLSearchParams({ target: s.dst.id, x: s.dst.x, y: s.dst.y, wood: s.wood || 0, stone: s.stone || 0, iron: s.iron || 0, h: csrf }).toString();
+    try {
+      const r = await fetch(url, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest", "TribalWars-Ajax": "1" },
+        body
+      });
+      let j = null, txt = "";
+      try { j = await r.clone().json(); } catch (e) { txt = await r.text(); }
+      const err = j && (j.error || (j.response && j.response.error));
+      if (err) { const m = Array.isArray(err) ? err.join("; ") : String(err); statusEl.textContent = "✗ " + m.slice(0, 70); statusEl.style.color = "#ffb4b4"; console.log("[Balanceador] erro envio:", j); return false; }
+      if (r.ok && j) { statusEl.textContent = "enviado ✓"; statusEl.style.color = "#9fe6b8"; return true; }
+      // resposta não reconhecida — mostra pra podermos ajustar
+      statusEl.textContent = "? resposta inesperada (ver detalhe)";
+      statusEl.style.color = "#ffd9a0";
+      console.log("[Balanceador] resposta de envio (nao reconhecida):", j || txt.slice(0, 300));
+      return false;
+    } catch (e) {
+      statusEl.textContent = "✗ falha: " + e.message; statusEl.style.color = "#ffb4b4"; return false;
+    }
+  }
+
   function renderPlan(sends, srcInfo, dstInfo) {
     const w = panelBase();
     const totMerch = sends.reduce((a, s) => a + s.merchants, 0);
@@ -285,31 +337,65 @@
 
     const missing = [...new Set([...(srcInfo.missing || []), ...(dstInfo.missing || [])])];
     const warn = missing.length
-      ? '<div style="background:#5a2b2e;color:#ffd7d7;padding:10px 14px;font-size:13px">⚠ Não achei a(s) coluna(s): <b>' + missing.join(", ") + '</b>. Ative essas colunas na Visão Geral (modo combinado) e rode de novo.</div>'
+      ? '<div style="background:#5a2b2e;color:#ffd7d7;padding:10px 14px;font-size:13px">⚠ Não achei a(s) coluna(s): <b>' + missing.join(", ") + '</b> na tela de Produção. Me avise pra ajustar.</div>'
       : "";
 
-    // cartões (melhor que tabela no mobile)
-    let cards = sends.map(s => {
+    let cards = sends.map((s, i) => {
       const parts = [];
       if (s.wood) parts.push("🪵 " + fmt(s.wood));
       if (s.stone) parts.push("🧱 " + fmt(s.stone));
       if (s.iron) parts.push("⚙️ " + fmt(s.iron));
       return '<div style="border-top:1px solid #4a331d;padding:12px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">' +
-        '<div style="flex:1;min-width:180px">' +
+        '<div style="flex:1;min-width:170px">' +
           '<div>' + esc(s.src.name) + ' <span style="color:#c9a">(' + s.src.x + '|' + s.src.y + ')</span></div>' +
           '<div style="color:#8fd">↓ ' + s.dist + ' campos · ' + s.merchants + ' merc.</div>' +
           '<div><b>' + esc(s.dst.name) + '</b> <span style="color:#c9a">(' + s.dst.x + '|' + s.dst.y + ')</span> <span style="color:#b98">' + fmt(s.dst.points) + ' pts</span></div>' +
           '<div style="color:#f0e6d8">' + parts.join("  ") + '</div>' +
         '</div>' +
-        '<a href="' + sendUrl(s) + '" target="_blank" rel="noopener" style="background:#3a7d54;color:#eafff0;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px" onclick="this.style.opacity=.4;this.textContent=\'enviado ✓\'">Enviar</a>' +
+        '<div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px;min-width:96px">' +
+          '<button class="bg-send" data-i="' + i + '" style="background:#3a7d54;color:#eafff0;padding:11px 18px;border:none;border-radius:8px;font-weight:bold;font-size:15px;cursor:pointer">Enviar</button>' +
+          '<span class="bg-status" data-si="' + i + '" style="font-size:12px;color:#b98;text-align:right;max-width:150px"></span>' +
+        '</div>' +
         '</div>';
     }).join("");
     if (!sends.length) cards = '<div style="padding:20px;text-align:center;color:#caa">Nenhum envio necessário — destinos já cheios ou origens sem excedente.</div>';
 
+    const sendAllBtn = sends.length
+      ? '<button id="bg-sendall" style="' + BTN + ';margin-top:6px">Enviar todos (' + sends.length + ')</button>'
+      : "";
+
     w.innerHTML = headerBar("Plano de envios", renderSetup) + warn +
       '<div style="padding:12px 14px;color:#d8c3a6;font-size:13px">Origem <b>' + srcInfo.villages.length + '</b> · Destino <b>' + dstInfo.villages.length + '</b> · <b>' + sends.length + '</b> envio(s) · <b>' + totMerch + '</b> mercadores<br>Total: 🪵 ' + fmt(tot.wood) + "  🧱 " + fmt(tot.stone) + "  ⚙️ " + fmt(tot.iron) + '</div>' +
+      '<div style="padding:0 14px">' + sendAllBtn + '</div>' +
       cards +
-      '<div style="padding:12px 14px;color:#b98;font-size:11px">Toque em cada "Enviar" (abre a praça de mercado já preenchida) e confirme. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%.</div>';
+      '<div style="padding:12px 14px;color:#b98;font-size:11px">Cada "Enviar" dispara o envio na hora. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%.</div>';
+
+    // liga os botões
+    const status = i => w.querySelector('.bg-status[data-si="' + i + '"]');
+    w.querySelectorAll(".bg-send").forEach(b => {
+      b.onclick = async () => {
+        const i = +b.dataset.i;
+        if (b.dataset.done) return true;
+        b.disabled = true; b.style.opacity = ".5";
+        const ok = await doSend(sends[i], status(i));
+        if (ok) { b.textContent = "enviado ✓"; b.dataset.done = "1"; }
+        else { b.disabled = false; b.style.opacity = "1"; b.textContent = "tentar de novo"; }
+        return ok;
+      };
+    });
+    const all = w.querySelector("#bg-sendall");
+    if (all) all.onclick = async () => {
+      all.disabled = true;
+      const btns = [...w.querySelectorAll(".bg-send")];
+      let done = 0;
+      for (const b of btns) {
+        if (b.dataset.done) continue;
+        all.textContent = "enviando… " + (++done) + "/" + btns.length;
+        await b.onclick();
+        await sleep(450); // evita disparar rápido demais
+      }
+      all.textContent = "concluído ✓"; all.disabled = false;
+    };
   }
 
   // ------------------------- EXECUÇÃO -------------------------
