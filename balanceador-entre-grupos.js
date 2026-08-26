@@ -1,0 +1,317 @@
+/* =========================================================================
+   BALANCEADOR ENTRE GRUPOS — Tribal Wars (versão nova)
+   -------------------------------------------------------------------------
+   Envia recursos das aldeias de um GRUPO DE ORIGEM para as aldeias de um
+   GRUPO DE DESTINO.
+     • prioriza as aldeias de destino MENORES (menos pontos) — crescem antes
+     • prefere a aldeia de ORIGEM mais PRÓXIMA de cada destino
+     • nunca ultrapassa o ARMAZÉM do destino (com margem de segurança)
+     • respeita os MERCADORES disponíveis em cada origem (1000 por mercador)
+   Ele calcula o plano e mostra links de envio já preenchidos (1 clique cada).
+   Não dispara envios sozinho — mais seguro contra captcha/regras do mundo.
+
+   COMO USAR (funciona no PC e no MOBILE, sem console)
+     1) Hospede este arquivo numa URL HTTPS pública (ex.: GitHub → jsDelivr).
+     2) No jogo: Configurações → Barra de acesso rápido (Quickbar) → adicionar
+        link. No campo de URL, cole:
+          javascript:$.getScript('https://SEU_HOST/balanceador-entre-grupos.js')
+     3) Toque no botão na barra de acesso rápido (dentro do jogo, no celular ou
+        no PC). Abre um painel na tela: escolha o grupo de origem e o de
+        destino, ajuste os %, toque em "Calcular plano" e depois em "Enviar"
+        em cada linha.
+
+   IMPORTANTE: confira as regras de scripts do SEU mundo. Só faz leitura +
+   monta links; o envio é você que confirma.
+   ========================================================================= */
+(async function () {
+  "use strict";
+
+  // ------------------------- AJUSTES -------------------------
+  const CFG = {
+    keepPercent: 10,     // % do armazém que a ORIGEM mantém (não esvazia tudo)
+    maxFillPercent: 90,  // enche o DESTINO só até esse % do armazém (margem p/ transportes em trânsito)
+    minSend: 1000,       // ignora envios menores que isso (1 mercador)
+    resources: ["wood", "stone", "iron"], // recursos a balancear
+    smallFirst: true,    // priorizar destinos com menos pontos
+    onlyResource: null   // "wood" | "stone" | "iron" para balancear só um; null = todos
+  };
+  // Tabela de capacidade do armazém por nível (fallback, caso a visão geral
+  // mostre o NÍVEL em vez da capacidade).
+  const WH_CAP = {1:1000,2:1229,3:1512,4:1859,5:2285,6:2810,7:3454,8:4247,9:5222,10:6420,11:7893,12:9705,13:11932,14:14670,15:18037,16:22177,17:27266,18:33523,19:41217,20:50675,21:62305,22:76604,23:94184,24:115798,25:142373,26:175047,27:215219,28:264611,29:325337,30:400000};
+
+  const origin = location.origin;
+  const num = s => { const n = parseInt(String(s == null ? "" : s).replace(/[^\d]/g, ""), 10); return isNaN(n) ? 0 : n; };
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const fetchDoc = async u => new DOMParser().parseFromString(await (await fetch(origin + u, { credentials: "same-origin" })).text(), "text/html");
+
+  // ------------------------- GRUPOS -------------------------
+  async function loadGroups() {
+    // Método 1 (mais confiável): lê o seletor de grupos na Visão Geral.
+    try {
+      const doc = await fetchDoc("/game.php?screen=overview_villages&mode=combined&page=-1");
+      const sel = doc.querySelector('#group_id, select[name="group_id"], select.group-select, #grouptable select');
+      if (sel) {
+        const opts = [...sel.querySelectorAll("option")]
+          .map(o => ({ id: String(o.value).trim(), name: (o.textContent || "").trim() }))
+          .filter(o => o.id && o.id !== "0" && o.name && !/^[-\s]+$/.test(o.name));
+        if (opts.length) return opts;
+      }
+    } catch (e) {}
+    // Método 2: ajax load_group_menu (com token CSRF, se disponível).
+    try {
+      const gd = window.game_data || {};
+      const h = gd.csrf || (window.csrf_token || "");
+      const r = await fetch(origin + "/game.php?screen=groups&ajax=load_group_menu" + (h ? "&h=" + h : ""), {
+        credentials: "same-origin", headers: { "X-Requested-With": "XMLHttpRequest", "TribalWars-Ajax": "1" }
+      });
+      const j = await r.json();
+      const list = (j && j.result) || (j && j.response && j.response.result) || [];
+      const out = list
+        .map(g => ({ id: String(g.group_id != null ? g.group_id : g[0]), name: (g.name != null ? g.name : g[1]) }))
+        .filter(g => g.id && g.id !== "0" && g.name);
+      if (out.length) return out;
+    } catch (e) {}
+    return [];
+  }
+
+  // ------------------------- LEITURA DA VISÃO GERAL -------------------------
+  // Usa a visão geral "combined" (recursos + armazém + mercadores + pontos).
+  // Detecta as colunas pelo cabeçalho (PT/EN) para ser robusto a temas/idiomas.
+  function headerMap(table) {
+    const map = {};
+    const ths = table.querySelectorAll("thead th");
+    ths.forEach((th, i) => {
+      const t = (th.textContent || "").toLowerCase();
+      if (/pont|point/.test(t)) map.points = i;
+      if (/armaz|warehouse|capac|storage/.test(t)) map.storage = i;
+      if (/mercador|merchant|trader/.test(t)) map.merchants = i;
+      if (/madeira|wood|lenh/.test(t)) map.wood = i;
+      if (/argila|barro|clay|stone/.test(t)) map.stone = i;
+      if (/ferro|iron/.test(t)) map.iron = i;
+    });
+    return map;
+  }
+  function readResFromRow(tr) {
+    // 1) tenta por classe (padrão comum das visões gerais)
+    const byClass = k => { const el = tr.querySelector("." + k + ", .res." + k + ", span." + k); return el ? num(el.textContent) : null; };
+    let w = byClass("wood"), c = byClass("stone"), i = byClass("iron");
+    if (w != null && c != null && i != null) return { wood: w, stone: c, iron: i };
+    return null; // deixa o chamador tentar por índice de coluna
+  }
+  function readStorage(tr, map) {
+    if (map.storage == null) return null;
+    const cell = tr.children[map.storage];
+    if (!cell) return null;
+    const val = num(cell.textContent);
+    // se o valor for pequeno, provavelmente é o NÍVEL do armazém → converte
+    if (val > 0 && val <= 30 && WH_CAP[val]) return WH_CAP[val];
+    return val || null;
+  }
+  function readMerchants(tr, map) {
+    if (map.merchants == null) return null;
+    const cell = tr.children[map.merchants];
+    if (!cell) return null;
+    // formato "disponíveis/total" → pega o primeiro número (disponíveis)
+    const m = (cell.textContent || "").match(/(\d[\d.]*)/);
+    return m ? num(m[1]) : 0;
+  }
+
+  async function readGroup(gid) {
+    const doc = await fetchDoc("/game.php?screen=overview_villages&mode=combined&group=" + gid + "&page=-1");
+    const table = doc.querySelector("#combined_table") || doc.querySelector("table.overview_table") || doc.querySelector("table");
+    if (!table) return { villages: [], missing: ["tabela"] };
+    const map = headerMap(table);
+    const rows = table.querySelectorAll("tbody tr");
+    const villages = [];
+    const missing = new Set();
+    rows.forEach(tr => {
+      const link = tr.querySelector('a[href*="village="]');
+      if (!link) return;
+      const mm = link.textContent.match(/(\d{1,3})\|(\d{1,3})/);
+      const idm = link.href.match(/village=(\d+)/);
+      if (!mm || !idm) return;
+      const v = {
+        id: +idm[1],
+        name: link.textContent.replace(/\s*\(\d+\|\d+\).*/, "").trim(),
+        x: +mm[1], y: +mm[2]
+      };
+      // pontos
+      v.points = (map.points != null && tr.children[map.points]) ? num(tr.children[map.points].textContent) : 0;
+      // recursos
+      let res = readResFromRow(tr);
+      if (!res && map.wood != null && map.stone != null && map.iron != null) {
+        res = { wood: num(tr.children[map.wood].textContent), stone: num(tr.children[map.stone].textContent), iron: num(tr.children[map.iron].textContent) };
+      }
+      if (!res) { missing.add("recursos"); res = { wood: 0, stone: 0, iron: 0 }; }
+      v.wood = res.wood; v.stone = res.stone; v.iron = res.iron;
+      // armazém
+      const st = readStorage(tr, map);
+      if (st == null) missing.add("armazém"); v.storage = st || 0;
+      // mercadores
+      const me = readMerchants(tr, map);
+      if (me == null) missing.add("mercadores"); v.merchants = me == null ? 0 : me;
+      villages.push(v);
+    });
+    return { villages, missing: [...missing] };
+  }
+
+  // ------------------------- ALGORITMO -------------------------
+  function buildPlan(sources, targets) {
+    const RES = CFG.onlyResource ? [CFG.onlyResource] : CFG.resources;
+    // estado das origens
+    const S = sources.map(v => ({
+      ...v,
+      merchantsLeft: v.merchants,
+      surplus: Object.fromEntries(RES.map(r => [r, Math.max(0, v[r] - Math.floor(CFG.keepPercent / 100 * v.storage))]))
+    }));
+    // estado dos destinos (espaço livre até maxFillPercent)
+    const cap = v => Math.floor(CFG.maxFillPercent / 100 * v.storage);
+    const T = targets.map(v => ({
+      ...v,
+      free: Object.fromEntries(RES.map(r => [r, Math.max(0, cap(v) - v[r])]))
+    }));
+    if (CFG.smallFirst) T.sort((a, b) => a.points - b.points); // menores primeiro
+
+    const sends = []; // {src, dst, wood, stone, iron, merchants, dist}
+    for (const dst of T) {
+      // origens ordenadas pela distância a este destino
+      const near = S.filter(s => s.id !== dst.id).sort((a, b) => dist(a, dst) - dist(b, dst));
+      for (const src of near) {
+        if (src.merchantsLeft <= 0) continue;
+        if (RES.every(r => dst.free[r] <= 0)) break; // destino cheio
+        // quanto cada recurso pode ir
+        let want = {}; let total = 0;
+        RES.forEach(r => { const amt = Math.min(dst.free[r], src.surplus[r]); want[r] = amt; total += amt; });
+        if (total < CFG.minSend) continue;
+        // limita pelos mercadores da origem
+        const maxCarry = src.merchantsLeft * 1000;
+        if (total > maxCarry) {
+          const f = maxCarry / total;
+          RES.forEach(r => { want[r] = Math.floor(want[r] * f); });
+          total = RES.reduce((s, r) => s + want[r], 0);
+        }
+        if (total < CFG.minSend) continue;
+        const merchants = Math.ceil(total / 1000);
+        // registra e atualiza estado
+        const send = { src, dst, merchants, dist: +dist(src, dst).toFixed(1), wood: 0, stone: 0, iron: 0 };
+        RES.forEach(r => { send[r] = want[r]; src.surplus[r] -= want[r]; dst.free[r] -= want[r]; });
+        src.merchantsLeft -= merchants;
+        sends.push(send);
+        if (RES.every(r => dst.free[r] <= 0)) break;
+      }
+    }
+    return sends;
+  }
+
+  // ------------------------- PAINEL (mobile-friendly) -------------------------
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const fmt = n => (n || 0).toLocaleString("pt-BR");
+  const val = id => { const el = document.getElementById(id); return el ? String(el.value).trim() : ""; };
+
+  function panelBase() {
+    document.getElementById("bal-grupos-panel")?.remove();
+    const w = document.createElement("div");
+    w.id = "bal-grupos-panel";
+    w.style.cssText = "position:fixed;left:50%;transform:translateX(-50%);bottom:0;z-index:2147483647;width:min(620px,100vw);max-height:92vh;overflow:auto;background:#2b1c10;color:#f0e6d8;border:2px solid #7a5230;border-bottom:none;border-radius:12px 12px 0 0;font:15px/1.5 Verdana,Arial,sans-serif;box-shadow:0 -8px 40px rgba(0,0,0,.6);-webkit-text-size-adjust:100%";
+    document.body.appendChild(w);
+    return w;
+  }
+  function headerBar(title, backFn) {
+    const back = backFn ? '<span id="bg-back" style="cursor:pointer;font-size:14px;padding:4px 8px;border:1px solid #7a5230;border-radius:6px">‹ trocar grupos</span>' : '<span></span>';
+    setTimeout(() => { const b = document.getElementById("bg-back"); if (b && backFn) b.onclick = backFn; }, 0);
+    return '<div style="position:sticky;top:0;display:flex;justify-content:space-between;align-items:center;background:#3a2716;padding:12px 14px;border-bottom:1px solid #7a5230">' +
+      back + '<b style="font-size:15px">' + title + '</b>' +
+      '<span style="cursor:pointer;font-size:20px;padding:0 6px" onclick="document.getElementById(\'bal-grupos-panel\').remove()">✕</span></div>';
+  }
+  const INP = "width:100%;box-sizing:border-box;font-size:16px;padding:10px;background:#1e130a;color:#f0e6d8;border:1px solid #7a5230;border-radius:8px";
+  const LBL = "display:block;font-size:12px;color:#c9a67e;margin:2px 0 4px;text-transform:uppercase;letter-spacing:.05em";
+  const BTN = "width:100%;font-size:16px;font-weight:bold;padding:13px;background:#3a7d54;color:#eafff0;border:none;border-radius:8px;cursor:pointer";
+
+  // ---- Tela 1: escolher grupos e ajustes ----
+  async function renderSetup() {
+    const w = panelBase();
+    w.innerHTML = headerBar("Balanceador entre grupos") + '<div style="padding:16px;color:#d8c3a6">Carregando grupos…</div>';
+    const groups = await loadGroups();
+
+    const groupField = (id, label) => groups.length
+      ? '<label style="' + LBL + '">' + label + '</label><select id="' + id + '" style="' + INP + '">' + groups.map(g => '<option value="' + esc(g.id) + '">' + esc(g.name) + '</option>').join("") + '</select>'
+      : '<label style="' + LBL + '">' + label + ' — digite o ID (group=XXXXX na URL do grupo)</label><input id="' + id + '" inputmode="numeric" placeholder="ex.: 12345" style="' + INP + '">';
+
+    w.innerHTML = headerBar("Balanceador entre grupos") +
+      '<div style="padding:16px;display:flex;flex-direction:column;gap:14px">' +
+        '<div>' + groupField("bg-src", "Grupo de ORIGEM (de onde sai o recurso)") + '</div>' +
+        '<div>' + groupField("bg-dst", "Grupo de DESTINO (aldeias pequenas que vão crescer)") + '</div>' +
+        '<div style="display:flex;gap:10px;flex-wrap:wrap">' +
+          '<div style="flex:1;min-width:130px"><label style="' + LBL + '">Manter na origem</label><input id="bg-keep" inputmode="numeric" value="' + CFG.keepPercent + '" style="' + INP + '"></div>' +
+          '<div style="flex:1;min-width:130px"><label style="' + LBL + '">Encher destino até</label><input id="bg-fill" inputmode="numeric" value="' + CFG.maxFillPercent + '" style="' + INP + '"></div>' +
+        '</div>' +
+        '<div><label style="' + LBL + '">Recurso</label><select id="bg-res" style="' + INP + '">' +
+          [["", "Todos"], ["wood", "Só madeira"], ["stone", "Só argila"], ["iron", "Só ferro"]].map(o => '<option value="' + o[0] + '"' + ((CFG.onlyResource || "") === o[0] ? " selected" : "") + '>' + o[1] + '</option>').join("") + '</select></div>' +
+        '<div id="bg-msg" style="color:#ffb4b4;font-size:13px;min-height:0"></div>' +
+        '<button id="bg-calc" style="' + BTN + '">Calcular plano</button>' +
+        '<div style="color:#b98;font-size:11px">Só lê seus dados e monta os links de envio — você confirma cada envio. Respeite as regras de scripts do seu mundo.</div>' +
+      '</div>';
+
+    document.getElementById("bg-calc").onclick = async () => {
+      const srcId = val("bg-src"), dstId = val("bg-dst");
+      const msg = document.getElementById("bg-msg");
+      if (!srcId || !dstId) { msg.textContent = "Escolha os dois grupos."; return; }
+      if (srcId === dstId) { msg.textContent = "Origem e destino não podem ser o mesmo grupo."; return; }
+      CFG.keepPercent = +val("bg-keep") || CFG.keepPercent;
+      CFG.maxFillPercent = +val("bg-fill") || CFG.maxFillPercent;
+      CFG.onlyResource = val("bg-res") || null;
+      const btn = document.getElementById("bg-calc");
+      btn.textContent = "Lendo aldeias…"; btn.disabled = true;
+      const srcInfo = await readGroup(srcId), dstInfo = await readGroup(dstId);
+      if (!srcInfo.villages.length || !dstInfo.villages.length) {
+        msg.innerHTML = "Não consegui ler aldeias. Origem: " + srcInfo.villages.length + " · Destino: " + dstInfo.villages.length + ".<br>Confira se os grupos têm aldeias e se a Visão Geral (modo combinado) mostra as colunas.";
+        btn.textContent = "Calcular plano"; btn.disabled = false; return;
+      }
+      const plan = buildPlan(srcInfo.villages, dstInfo.villages);
+      renderPlan(plan, srcInfo, dstInfo);
+    };
+  }
+
+  // ---- Tela 2: plano de envios ----
+  function sendUrl(s) {
+    return origin + "/game.php?village=" + s.src.id + "&screen=market&mode=send&target=" + s.dst.id +
+      "&wood=" + (s.wood || 0) + "&stone=" + (s.stone || 0) + "&iron=" + (s.iron || 0);
+  }
+  function renderPlan(sends, srcInfo, dstInfo) {
+    const w = panelBase();
+    const totMerch = sends.reduce((a, s) => a + s.merchants, 0);
+    const tot = { wood: 0, stone: 0, iron: 0 };
+    sends.forEach(s => { tot.wood += s.wood; tot.stone += s.stone; tot.iron += s.iron; });
+
+    const missing = [...new Set([...(srcInfo.missing || []), ...(dstInfo.missing || [])])];
+    const warn = missing.length
+      ? '<div style="background:#5a2b2e;color:#ffd7d7;padding:10px 14px;font-size:13px">⚠ Não achei a(s) coluna(s): <b>' + missing.join(", ") + '</b>. Ative essas colunas na Visão Geral (modo combinado) e rode de novo.</div>'
+      : "";
+
+    // cartões (melhor que tabela no mobile)
+    let cards = sends.map(s => {
+      const parts = [];
+      if (s.wood) parts.push("🪵 " + fmt(s.wood));
+      if (s.stone) parts.push("🧱 " + fmt(s.stone));
+      if (s.iron) parts.push("⚙️ " + fmt(s.iron));
+      return '<div style="border-top:1px solid #4a331d;padding:12px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">' +
+        '<div style="flex:1;min-width:180px">' +
+          '<div>' + esc(s.src.name) + ' <span style="color:#c9a">(' + s.src.x + '|' + s.src.y + ')</span></div>' +
+          '<div style="color:#8fd">↓ ' + s.dist + ' campos · ' + s.merchants + ' merc.</div>' +
+          '<div><b>' + esc(s.dst.name) + '</b> <span style="color:#c9a">(' + s.dst.x + '|' + s.dst.y + ')</span> <span style="color:#b98">' + fmt(s.dst.points) + ' pts</span></div>' +
+          '<div style="color:#f0e6d8">' + parts.join("  ") + '</div>' +
+        '</div>' +
+        '<a href="' + sendUrl(s) + '" target="_blank" rel="noopener" style="background:#3a7d54;color:#eafff0;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px" onclick="this.style.opacity=.4;this.textContent=\'enviado ✓\'">Enviar</a>' +
+        '</div>';
+    }).join("");
+    if (!sends.length) cards = '<div style="padding:20px;text-align:center;color:#caa">Nenhum envio necessário — destinos já cheios ou origens sem excedente.</div>';
+
+    w.innerHTML = headerBar("Plano de envios", renderSetup) + warn +
+      '<div style="padding:12px 14px;color:#d8c3a6;font-size:13px">Origem <b>' + srcInfo.villages.length + '</b> · Destino <b>' + dstInfo.villages.length + '</b> · <b>' + sends.length + '</b> envio(s) · <b>' + totMerch + '</b> mercadores<br>Total: 🪵 ' + fmt(tot.wood) + "  🧱 " + fmt(tot.stone) + "  ⚙️ " + fmt(tot.iron) + '</div>' +
+      cards +
+      '<div style="padding:12px 14px;color:#b98;font-size:11px">Toque em cada "Enviar" (abre a praça de mercado já preenchida) e confirme. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%.</div>';
+  }
+
+  // ------------------------- EXECUÇÃO -------------------------
+  renderSetup();
+})();
