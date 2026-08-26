@@ -42,7 +42,33 @@
   const origin = location.origin;
   const num = s => { const n = parseInt(String(s == null ? "" : s).replace(/[^\d]/g, ""), 10); return isNaN(n) ? 0 : n; };
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
-  const fetchDoc = async u => new DOMParser().parseFromString(await (await fetch(origin + u, { credentials: "same-origin" })).text(), "text/html");
+
+  // ------------------------- LOG DE DEBUG -------------------------
+  const LOG = [];
+  function log(msg, obj) {
+    const line = msg + (obj !== undefined ? " → " + (typeof obj === "object" ? JSON.stringify(obj) : String(obj)) : "");
+    LOG.push(line);
+    try { console.log("%c[Balanceador]", "color:#e5484d;font-weight:bold", msg, obj !== undefined ? obj : ""); } catch (e) {}
+  }
+
+  const fetchDoc = async u => {
+    log("fetch", u);
+    let resp, txt;
+    try {
+      resp = await fetch(origin + u, { credentials: "same-origin" });
+      log("  status HTTP", resp.status);
+      txt = await resp.text();
+      log("  bytes recebidos", txt.length);
+    } catch (e) {
+      log("  ERRO no fetch", e.message);
+      return new DOMParser().parseFromString("<html></html>", "text/html");
+    }
+    const doc = new DOMParser().parseFromString(txt, "text/html");
+    log("  tabelas na página", doc.querySelectorAll("table").length);
+    log("  <tr> na página", doc.querySelectorAll("tr").length);
+    log("  links village= na página", doc.querySelectorAll('a[href*="village="]').length);
+    return doc;
+  };
 
   // ------------------------- GRUPOS -------------------------
   async function loadGroups() {
@@ -68,7 +94,7 @@
           .filter(o => o.id && o.id !== "0" && o.name && !/^[-\s]+$/.test(o.name));
         if (opts.length) return opts;
       }
-    } catch (e) {}
+    } catch (e) { log("loadGroups método 1 erro", e.message); }
     // Método 2: ajax load_group_menu (com token CSRF, se disponível).
     try {
       const gd = window.game_data || {};
@@ -82,7 +108,7 @@
         .map(g => ({ id: String(g.group_id != null ? g.group_id : g[0]), name: (g.name != null ? g.name : g[1]) }))
         .filter(g => g.id && g.id !== "0" && g.name);
       if (out.length) return out;
-    } catch (e) {}
+    } catch (e) { log("loadGroups método 2 erro", e.message); }
     return [];
   }
 
@@ -150,16 +176,29 @@
   }
 
   async function readGroup(gid) {
+    log("=== readGroup grupo " + gid + " ===");
     const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&group=" + gid + "&page=-1");
     const map = findHeaderMap(doc);
+    log("mapa de colunas", map);
+    if (map.points == null && map.res == null && map.storage == null) {
+      log("!! não achei a linha de cabeçalho (Recursos+Armazém). Amostra de <th> na página:");
+      const ths = [...doc.querySelectorAll("th")].slice(0, 12).map(th => (th.textContent || "").trim()).filter(Boolean);
+      log("   <th> encontrados", ths);
+    }
     // linhas de aldeia = qualquer <tr> com link de aldeia E uma coordenada
-    const rows = [...doc.querySelectorAll("tr")].filter(tr =>
-      tr.querySelector('a[href*="village="]') && /\d{1,3}\|\d{1,3}/.test(tr.textContent || ""));
+    const allTr = [...doc.querySelectorAll("tr")];
+    const withLink = allTr.filter(tr => tr.querySelector('a[href*="village="]'));
+    const rows = withLink.filter(tr => /\d{1,3}\|\d{1,3}/.test(tr.textContent || ""));
+    log("linhas: total=" + allTr.length + " comLink=" + withLink.length + " comCoord(aldeias)=" + rows.length);
+    if (withLink.length && !rows.length) {
+      log("!! tem link mas nenhuma coord casou. Amostra do texto da 1ª linha com link:", (withLink[0].textContent || "").replace(/\s+/g, " ").trim().slice(0, 120));
+    }
     const villages = [];
     const missing = new Set();
     if (map.res == null && !(map.wood != null && map.stone != null && map.iron != null)) missing.add("recursos");
     if (map.storage == null) missing.add("armazém");
     if (map.merchants == null) missing.add("mercadores");
+    let firstLogged = false;
     rows.forEach(tr => {
       const link = tr.querySelector('a[href*="village="]');
       const idm = link.href.match(/village=(\d+)/);
@@ -177,8 +216,10 @@
       v.storage = readStorage(tr, map) || 0;
       const me = readMerchants(tr, map);
       v.merchants = me == null ? 0 : me;
+      if (!firstLogged) { log("1ª aldeia lida", { nome: v.name, x: v.x, y: v.y, pts: v.points, w: v.wood, s: v.stone, i: v.iron, arm: v.storage, merc: v.merchants, res_ok: !!res }); firstLogged = true; }
       villages.push(v);
     });
+    log("total de aldeias lidas: " + villages.length);
     return { villages, missing: [...missing] };
   }
 
@@ -287,16 +328,41 @@
       CFG.keepPercent = +val("bg-keep") || CFG.keepPercent;
       CFG.maxFillPercent = +val("bg-fill") || CFG.maxFillPercent;
       CFG.onlyResource = val("bg-res") || null;
+      LOG.length = 0;
+      log("game_data?", !!window.game_data);
+      log("csrf?", (window.game_data && window.game_data.csrf) || window.csrf_token || "NÃO ACHEI");
+      log("grupo origem=" + srcId + " destino=" + dstId);
       const btn = document.getElementById("bg-calc");
       btn.textContent = "Lendo aldeias…"; btn.disabled = true;
       const srcInfo = await readGroup(srcId), dstInfo = await readGroup(dstId);
       if (!srcInfo.villages.length || !dstInfo.villages.length) {
-        msg.innerHTML = "Não consegui ler aldeias. Origem: " + srcInfo.villages.length + " · Destino: " + dstInfo.villages.length + ".<br>Confira se os grupos têm aldeias e se a Visão Geral (modo combinado) mostra as colunas.";
-        btn.textContent = "Calcular plano"; btn.disabled = false; return;
+        msg.innerHTML = "Não consegui ler aldeias. Origem: " + srcInfo.villages.length + " · Destino: " + dstInfo.villages.length + ".";
+        btn.textContent = "Calcular plano"; btn.disabled = false;
+        showDebug();
+        return;
       }
       const plan = buildPlan(srcInfo.villages, dstInfo.villages);
       renderPlan(plan, srcInfo, dstInfo);
     };
+  }
+
+  // Mostra o log de debug num painel copiável.
+  function showDebug() {
+    let box = document.getElementById("bg-debug");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "bg-debug";
+      box.style.cssText = "margin:0 16px 16px;background:#120a05;border:1px solid #7a5230;border-radius:8px;padding:10px";
+      const msg = document.getElementById("bg-msg");
+      (msg && msg.parentNode) ? msg.parentNode.appendChild(box) : document.getElementById("bal-grupos-panel").appendChild(box);
+    }
+    box.innerHTML =
+      '<div style="color:#f5a623;font-weight:bold;margin-bottom:6px">Debug (copie e me mande):</div>' +
+      '<textarea readonly style="width:100%;box-sizing:border-box;height:180px;background:#0a0603;color:#cbb;border:1px solid #4a331d;border-radius:6px;font-size:11px;font-family:monospace">' +
+      esc(LOG.join("\n")) + '</textarea>' +
+      '<button id="bg-copylog" style="margin-top:6px;padding:8px 12px;background:#3a2716;color:#f0e6d8;border:1px solid #7a5230;border-radius:6px;cursor:pointer">Copiar log</button>';
+    const cp = document.getElementById("bg-copylog");
+    if (cp) cp.onclick = () => { try { navigator.clipboard.writeText(LOG.join("\n")); cp.textContent = "Copiado!"; } catch (e) { const t = box.querySelector("textarea"); t.focus(); t.select(); } };
   }
 
   // ---- Tela 2: plano de envios ----
