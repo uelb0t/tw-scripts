@@ -43,6 +43,30 @@
   const num = s => { const n = parseInt(String(s == null ? "" : s).replace(/[^\d]/g, ""), 10); return isNaN(n) ? 0 : n; };
   const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
+  // Velocidade do mundo (para o tempo de viagem dos mercadores). O mercador anda
+  // a 60 min/campo em velocidade 1; tempo = distância * 60 / worldSpeed (minutos).
+  let WORLD_SPEED = 1;
+  async function loadWorldSpeed() {
+    try {
+      const r = await fetch(origin + "/interface.php?func=get_config", { credentials: "same-origin" });
+      const xml = new DOMParser().parseFromString(await r.text(), "text/xml");
+      const s = xml.querySelector("speed");
+      if (s) WORLD_SPEED = parseFloat(s.textContent) || 1;
+    } catch (e) {}
+  }
+  function travelMinutes(fields) { return fields * 60 / WORLD_SPEED; }
+  function fmtDuration(min) {
+    const totalSec = Math.round(min * 60);
+    const h = Math.floor(totalSec / 3600), m = Math.floor((totalSec % 3600) / 60), s = totalSec % 60;
+    const p = n => String(n).padStart(2, "0");
+    return (h > 0 ? h + "h" : "") + p(m) + "m" + p(s) + "s";
+  }
+  function arrivalClock(min) {
+    const d = new Date(Date.now() + min * 60000);
+    const p = n => String(n).padStart(2, "0");
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+
   // ------------------------- LOG DE DEBUG -------------------------
   const LOG = [];
   function log(msg, obj) {
@@ -273,7 +297,8 @@
         if (total < CFG.minSend) continue;
         const merchants = Math.ceil(total / 1000);
         // registra e atualiza estado
-        const send = { src, dst, merchants, dist: +dist(src, dst).toFixed(1), wood: 0, stone: 0, iron: 0 };
+        const d = dist(src, dst);
+        const send = { src, dst, merchants, dist: +d.toFixed(1), minutes: travelMinutes(d), wood: 0, stone: 0, iron: 0 };
         RES.forEach(r => { send[r] = want[r]; src.surplus[r] -= want[r]; dst.free[r] -= want[r]; });
         src.merchantsLeft -= merchants;
         sends.push(send);
@@ -346,6 +371,8 @@
       log("grupo origem=" + srcId + " destino=" + dstId);
       const btn = document.getElementById("bg-calc");
       btn.textContent = "Lendo aldeias…"; btn.disabled = true;
+      await loadWorldSpeed();
+      log("velocidade do mundo", WORLD_SPEED);
       const srcInfo = await readGroup(srcId), dstInfo = await readGroup(dstId);
       if (!srcInfo.villages.length || !dstInfo.villages.length) {
         msg.innerHTML = "Não consegui ler aldeias. Origem: " + srcInfo.villages.length + " · Destino: " + dstInfo.villages.length + ".";
@@ -383,33 +410,35 @@
     return origin + "/game.php?village=" + s.src.id + "&screen=market&mode=send&target=" + s.dst.id +
       "&wood=" + (s.wood || 0) + "&stone=" + (s.stone || 0) + "&iron=" + (s.iron || 0);
   }
-  // ENVIO REAL: usa o endpoint de envio de recursos do jogo (map_send), no
-  // contexto da aldeia de origem, com o token de sessão (csrf).
+  // ENVIO REAL (modo diagnóstico): dispara o envio e MOSTRA a resposta crua do
+  // servidor. Só considera sucesso com sinal claro; senão mantém o cartão e
+  // registra a resposta pra ajustarmos o endpoint.
   async function doSend(s, statusEl) {
     statusEl.textContent = "enviando…"; statusEl.style.color = "#e8d9a0";
-    const gd = window.game_data || {};
-    const csrf = gd.csrf || window.csrf_token || "";
-    const url = origin + "/game.php?village=" + s.src.id + "&screen=market&mode=send&ajax=map_send" + (csrf ? "&h=" + csrf : "");
-    const body = new URLSearchParams({ target: s.dst.id, x: s.dst.x, y: s.dst.y, wood: s.wood || 0, stone: s.stone || 0, iron: s.iron || 0, h: csrf }).toString();
-    try {
-      const r = await fetch(url, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8", "X-Requested-With": "XMLHttpRequest", "TribalWars-Ajax": "1" },
-        body
-      });
-      let j = null, txt = "";
-      try { j = await r.clone().json(); } catch (e) { txt = await r.text(); }
-      const err = j && (j.error || (j.response && j.response.error));
-      if (err) { const m = Array.isArray(err) ? err.join("; ") : String(err); statusEl.textContent = "✗ " + m.slice(0, 70); statusEl.style.color = "#ffb4b4"; console.log("[Balanceador] erro envio:", j); return false; }
-      if (r.ok && j) { statusEl.textContent = "enviado ✓"; statusEl.style.color = "#9fe6b8"; return true; }
-      // resposta não reconhecida — mostra pra podermos ajustar
-      statusEl.textContent = "? resposta inesperada (ver detalhe)";
-      statusEl.style.color = "#ffd9a0";
-      console.log("[Balanceador] resposta de envio (nao reconhecida):", j || txt.slice(0, 300));
-      return false;
-    } catch (e) {
-      statusEl.textContent = "✗ falha: " + e.message; statusEl.style.color = "#ffb4b4"; return false;
-    }
+    log("ENVIO " + s.src.name + "(" + s.src.id + ") -> " + s.dst.name + " w" + s.wood + " s" + s.stone + " i" + s.iron);
+    // Método idêntico ao Warehouse Balancer (Shinko to Kuma), que funciona no br142:
+    //   TribalWars.post("market", {ajaxaction:"map_send", village:origem}, {target_id, wood, stone, iron}, cb)
+    return new Promise(resolve => {
+      const data = { target_id: s.dst.id, wood: s.wood || 0, stone: s.stone || 0, iron: s.iron || 0 };
+      let settled = false;
+      const done = (ok, txt, color) => { if (settled) return; settled = true; statusEl.textContent = txt; statusEl.style.color = color; resolve(ok); };
+      try {
+        if (!(window.TribalWars && TribalWars.post)) { done(false, "✗ TribalWars.post indisponível", "#ffb4b4"); return; }
+        TribalWars.post("market", { ajaxaction: "map_send", village: s.src.id }, data,
+          function (resp) {
+            log("  resposta OK", resp && (resp.message || JSON.stringify(resp)).slice(0, 200));
+            try { if (resp && resp.message && window.UI && UI.SuccessMessage) UI.SuccessMessage(resp.message); } catch (e) {}
+            done(true, "enviado ✓", "#9fe6b8");
+          },
+          false // 4º arg = false, igual ao script de referência (sem callback de erro próprio)
+        );
+        // TribalWars.post não tem timeout; se em 8s não confirmou, libera o cartão
+        setTimeout(() => done(false, "sem resposta (tente de novo)", "#ffd9a0"), 8000);
+      } catch (e) {
+        log("  EXCEÇÃO", e.message);
+        done(false, "✗ falha: " + e.message, "#ffb4b4");
+      }
+    });
   }
 
   function renderPlan(sends, srcInfo, dstInfo) {
@@ -428,10 +457,11 @@
       if (s.wood) parts.push("🪵 " + fmt(s.wood));
       if (s.stone) parts.push("🧱 " + fmt(s.stone));
       if (s.iron) parts.push("⚙️ " + fmt(s.iron));
-      return '<div style="border-top:1px solid #4a331d;padding:12px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">' +
+      const tempo = s.minutes != null ? fmtDuration(s.minutes) + " · chega " + arrivalClock(s.minutes) : "";
+      return '<div class="bg-card" data-card="' + i + '" style="border-top:1px solid #4a331d;padding:12px 14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">' +
         '<div style="flex:1;min-width:170px">' +
           '<div>' + esc(s.src.name) + ' <span style="color:#c9a">(' + s.src.x + '|' + s.src.y + ')</span></div>' +
-          '<div style="color:#8fd">↓ ' + s.dist + ' campos · ' + s.merchants + ' merc.</div>' +
+          '<div style="color:#8fd">↓ ' + s.dist + ' campos · ' + s.merchants + ' merc.' + (tempo ? ' · ⏱ ' + tempo : '') + '</div>' +
           '<div><b>' + esc(s.dst.name) + '</b> <span style="color:#c9a">(' + s.dst.x + '|' + s.dst.y + ')</span> <span style="color:#b98">' + fmt(s.dst.points) + ' pts</span></div>' +
           '<div style="color:#f0e6d8">' + parts.join("  ") + '</div>' +
         '</div>' +
@@ -441,7 +471,8 @@
         '</div>' +
         '</div>';
     }).join("");
-    if (!sends.length) cards = '<div style="padding:20px;text-align:center;color:#caa">Nenhum envio necessário — destinos já cheios ou origens sem excedente.</div>';
+    cards = '<div id="bg-cards">' + cards + '</div>';
+    const emptyMsg = '<div id="bg-empty" style="padding:20px;text-align:center;color:#9fe6b8;display:' + (sends.length ? "none" : "block") + '">' + (sends.length ? "Todos os envios concluídos ✓" : "Nenhum envio necessário — destinos já cheios ou origens sem excedente.") + '</div>';
 
     const sendAllBtn = sends.length
       ? '<button id="bg-sendall" style="' + BTN + ';margin-top:6px">Enviar todos (' + sends.length + ')</button>'
@@ -450,35 +481,56 @@
     w.innerHTML = headerBar("Plano de envios", renderSetup) + warn +
       '<div style="padding:12px 14px;color:#d8c3a6;font-size:13px">Origem <b>' + srcInfo.villages.length + '</b> · Destino <b>' + dstInfo.villages.length + '</b> · <b>' + sends.length + '</b> envio(s) · <b>' + totMerch + '</b> mercadores<br>Total: 🪵 ' + fmt(tot.wood) + "  🧱 " + fmt(tot.stone) + "  ⚙️ " + fmt(tot.iron) + '</div>' +
       '<div style="padding:0 14px">' + sendAllBtn + '</div>' +
-      cards +
-      '<div style="padding:12px 14px;color:#b98;font-size:11px">Cada "Enviar" dispara o envio na hora. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%.</div>';
+      cards + emptyMsg +
+      '<div style="padding:12px 14px;color:#b98;font-size:11px">Cada "Enviar" dispara na hora e some da lista quando confirmado. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%. ⏱ = tempo dos mercadores.</div>' +
+      '<div style="padding:0 14px 14px"><button id="bg-showlog" style="padding:8px 12px;background:#3a2716;color:#f0e6d8;border:1px solid #7a5230;border-radius:6px;cursor:pointer;font-size:12px">Ver debug dos envios</button></div>';
 
     // liga os botões
     const status = i => w.querySelector('.bg-status[data-si="' + i + '"]');
+    const all = w.querySelector("#bg-sendall");
+    let restantes = sends.length;
+    function refreshCount() {
+      restantes = w.querySelectorAll(".bg-card").length;
+      if (all) all.textContent = restantes ? "Enviar todos (" + restantes + ")" : "concluído ✓";
+      if (!restantes) {
+        const emp = w.querySelector("#bg-empty");
+        if (emp) { emp.textContent = "Todos os envios concluídos ✓"; emp.style.display = "block"; }
+        if (all) all.style.display = "none";
+      }
+    }
+    function removeCard(i) {
+      const card = w.querySelector('.bg-card[data-card="' + i + '"]');
+      if (card) {
+        card.style.transition = "opacity .25s"; card.style.opacity = "0";
+        setTimeout(() => { card.remove(); refreshCount(); }, 250);
+      }
+    }
     w.querySelectorAll(".bg-send").forEach(b => {
       b.onclick = async () => {
         const i = +b.dataset.i;
         if (b.dataset.done) return true;
         b.disabled = true; b.style.opacity = ".5";
         const ok = await doSend(sends[i], status(i));
-        if (ok) { b.textContent = "enviado ✓"; b.dataset.done = "1"; }
+        if (ok) { b.dataset.done = "1"; removeCard(i); }        // some da lista ao concluir
         else { b.disabled = false; b.style.opacity = "1"; b.textContent = "tentar de novo"; }
         return ok;
       };
     });
-    const all = w.querySelector("#bg-sendall");
     if (all) all.onclick = async () => {
       all.disabled = true;
       const btns = [...w.querySelectorAll(".bg-send")];
       let done = 0;
       for (const b of btns) {
         if (b.dataset.done) continue;
-        all.textContent = "enviando… " + (++done) + "/" + btns.length;
+        done++;
         await b.onclick();
         await sleep(450); // evita disparar rápido demais
       }
-      all.textContent = "concluído ✓"; all.disabled = false;
+      all.disabled = false;
+      refreshCount();
     };
+    const showlog = w.querySelector("#bg-showlog");
+    if (showlog) showlog.onclick = () => showDebug();
   }
 
   // ------------------------- EXECUÇÃO -------------------------
