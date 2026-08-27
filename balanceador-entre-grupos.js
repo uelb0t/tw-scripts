@@ -76,15 +76,27 @@
     try {
       const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&page=-1");
       const seen = {}, out = [];
-      doc.querySelectorAll('a[href*="group="]').forEach(a => {
-        const m = a.href.match(/[?&]group=(\d+)/);
-        if (!m) return;
-        const id = m[1];
-        if (id === "0" || seen[id]) return;
+      // preferir os itens do menu de grupos (data-group-id / classe group-menu-item)
+      doc.querySelectorAll('.group-menu-item[data-group-id], a[data-group-id]').forEach(a => {
+        const id = String(a.getAttribute("data-group-id") || "").trim();
+        if (!id || id === "0" || seen[id]) return;
         const name = (a.textContent || "").replace(/[\[\]<>]/g, "").trim();
         if (!name) return;
         seen[id] = 1; out.push({ id, name });
       });
+      // fallback: qualquer link com group= na URL
+      if (!out.length) {
+        doc.querySelectorAll('a[href*="group="]').forEach(a => {
+          const m = a.href.match(/[?&]group=(\d+)/);
+          if (!m) return;
+          const id = m[1];
+          if (id === "0" || seen[id]) return;
+          const name = (a.textContent || "").replace(/[\[\]<>]/g, "").trim();
+          if (!name) return;
+          seen[id] = 1; out.push({ id, name });
+        });
+      }
+      log("grupos encontrados", out.length);
       if (out.length) return out;
       // fallback: seletor <select> (layout antigo)
       const sel = doc.querySelector('#group_id, select[name="group_id"], select.group-select');
@@ -113,28 +125,33 @@
   }
 
   // ------------------------- LEITURA DA VISÃO GERAL (PRODUÇÃO) -------------------------
-  // Encontra a linha de cabeçalho da tabela de aldeias (a que tem "Recursos" e
-  // "Armazém") e mapeia as colunas — independe de id/estrutura da tabela.
-  function findHeaderMap(doc) {
-    const trs = [...doc.querySelectorAll("tr")];
-    let headerRow = null;
-    for (const tr of trs) {
-      const t = (tr.textContent || "").toLowerCase();
-      if (/recurso|resource/.test(t) && /armaz|warehouse|storage/.test(t) && tr.querySelector("th,td")) { headerRow = tr; break; }
+  // Localiza a tabela de aldeias (production_table) e mapeia colunas pelo SEU cabeçalho.
+  function findTableAndMap(doc) {
+    // 1) tabela oficial da tela Produção
+    let table = doc.querySelector("#production_table");
+    // 2) senão, a tabela que tem mais linhas com link de aldeia + coordenada
+    if (!table) {
+      let best = null, bestCount = 0;
+      doc.querySelectorAll("table").forEach(t => {
+        const c = [...t.querySelectorAll("tr")].filter(tr => tr.querySelector('a[href*="village="]') && /\d{1,3}\|\d{1,3}/.test(tr.textContent || "")).length;
+        if (c > bestCount) { bestCount = c; best = t; }
+      });
+      table = best;
     }
     const map = {};
-    if (!headerRow) return map;
-    [...headerRow.children].forEach((c, i) => {
-      const t = (c.textContent || "").toLowerCase();
-      if (/pont|point/.test(t)) map.points = i;
-      if (/recurso|resource/.test(t)) map.res = i;                       // coluna única com os 3 recursos
-      if (/armaz|warehouse|capac|storage/.test(t)) map.storage = i;
-      if (/comerciante|mercador|merchant|trader/.test(t)) map.merchants = i;
-      if (/madeira|wood|lenh/.test(t)) map.wood = i;                     // (layouts com colunas separadas)
-      if (/argila|barro|clay/.test(t)) map.stone = i;
-      if (/ferro|iron/.test(t)) map.iron = i;
-    });
-    return map;
+    if (!table) return { table: null, map };
+    // cabeçalho = 1ª linha com <th> dentro DESSA tabela
+    const headTr = table.querySelector("thead tr") || [...table.querySelectorAll("tr")].find(tr => tr.querySelector("th"));
+    if (headTr) {
+      [...headTr.children].forEach((c, i) => {
+        const t = (c.textContent || "").toLowerCase();
+        if (/pont|point/.test(t)) map.points = i;
+        if (/recurso|resource/.test(t)) map.res = i;
+        if (/armaz|warehouse|capac|storage/.test(t)) map.storage = i;
+        if (/comerciante|mercador|merchant|trader/.test(t)) map.merchants = i;
+      });
+    }
+    return { table, map };
   }
   // extrai os 3 primeiros números de um texto (madeira, argila, ferro), aceitando "80.928"
   function threeNums(txt) {
@@ -178,24 +195,20 @@
   async function readGroup(gid) {
     log("=== readGroup grupo " + gid + " ===");
     const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&group=" + gid + "&page=-1");
-    const map = findHeaderMap(doc);
+    const { table, map } = findTableAndMap(doc);
+    log("achou production_table?", !!table);
     log("mapa de colunas", map);
-    if (map.points == null && map.res == null && map.storage == null) {
-      log("!! não achei a linha de cabeçalho (Recursos+Armazém). Amostra de <th> na página:");
-      const ths = [...doc.querySelectorAll("th")].slice(0, 12).map(th => (th.textContent || "").trim()).filter(Boolean);
-      log("   <th> encontrados", ths);
+    if (!table) {
+      log("!! nenhuma tabela de aldeias encontrada");
+      return { villages: [], missing: ["tabela"] };
     }
-    // linhas de aldeia = qualquer <tr> com link de aldeia E uma coordenada
-    const allTr = [...doc.querySelectorAll("tr")];
-    const withLink = allTr.filter(tr => tr.querySelector('a[href*="village="]'));
-    const rows = withLink.filter(tr => /\d{1,3}\|\d{1,3}/.test(tr.textContent || ""));
-    log("linhas: total=" + allTr.length + " comLink=" + withLink.length + " comCoord(aldeias)=" + rows.length);
-    if (withLink.length && !rows.length) {
-      log("!! tem link mas nenhuma coord casou. Amostra do texto da 1ª linha com link:", (withLink[0].textContent || "").replace(/\s+/g, " ").trim().slice(0, 120));
-    }
+    // linhas de aldeia = <tr> DENTRO da tabela, com link de aldeia E coordenada
+    const allTr = [...table.querySelectorAll("tr")];
+    const rows = allTr.filter(tr => tr.querySelector('a[href*="village="]') && /\d{1,3}\|\d{1,3}/.test(tr.textContent || ""));
+    log("linhas na tabela: total=" + allTr.length + " aldeias=" + rows.length);
     const villages = [];
     const missing = new Set();
-    if (map.res == null && !(map.wood != null && map.stone != null && map.iron != null)) missing.add("recursos");
+    if (map.res == null) missing.add("recursos(coluna)"); // recursos são lidos por classe; isto é só informativo
     if (map.storage == null) missing.add("armazém");
     if (map.merchants == null) missing.add("mercadores");
     let firstLogged = false;
@@ -204,11 +217,10 @@
       const idm = link.href.match(/village=(\d+)/);
       const mm = (tr.textContent || "").match(/(\d{1,3})\|(\d{1,3})/);
       if (!idm || !mm) return;
-      const v = {
-        id: +idm[1],
-        name: (link.textContent || "").trim().replace(/\s*\(\d+\|\d+\).*/, "") || (link.textContent || "").trim(),
-        x: +mm[1], y: +mm[2]
-      };
+      // nome: usa o data-text da label quando existir (evita pegar "Edifício principal" etc.)
+      const label = tr.querySelector(".quickedit-label");
+      const name = (label && (label.getAttribute("data-text") || label.textContent) || link.textContent || "").trim().replace(/\s*\(\d+\|\d+\).*/, "");
+      const v = { id: +idm[1], name: name || ("Aldeia " + idm[1]), x: +mm[1], y: +mm[2] };
       v.points = (map.points != null && tr.children[map.points]) ? num(tr.children[map.points].textContent) : 0;
       const res = readRes(tr, map);
       if (res) { v.wood = res.wood; v.stone = res.stone; v.iron = res.iron; }
