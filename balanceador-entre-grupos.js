@@ -147,142 +147,90 @@
     return [];
   }
 
-  // ------------------------- LEITURA DA VISÃO GERAL (PRODUÇÃO) -------------------------
-  // Localiza a tabela de aldeias (production_table) e mapeia colunas pelo SEU cabeçalho.
-  function findTableAndMap(doc) {
-    // 1) tabela oficial da tela Produção
-    let table = doc.querySelector("#production_table");
-    // 2) senão, a tabela que tem mais linhas com link de aldeia + coordenada
-    if (!table) {
-      let best = null, bestCount = 0;
-      doc.querySelectorAll("table").forEach(t => {
-        const c = [...t.querySelectorAll("tr")].filter(tr => tr.querySelector('a[href*="village="]') && /\d{1,3}\|\d{1,3}/.test(tr.textContent || "")).length;
-        if (c > bestCount) { bestCount = c; best = t; }
-      });
-      table = best;
-    }
-    const map = {};
-    if (!table) return { table: null, map };
-    // cabeçalho = 1ª linha com <th> dentro DESSA tabela
-    const headTr = table.querySelector("thead tr") || [...table.querySelectorAll("tr")].find(tr => tr.querySelector("th"));
-    if (headTr) {
-      [...headTr.children].forEach((c, i) => {
-        const t = (c.textContent || "").toLowerCase();
-        if (/pont|point/.test(t)) map.points = i;
-        if (/recurso|resource/.test(t)) map.res = i;
-        if (/armaz|warehouse|capac|storage/.test(t)) map.storage = i;
-        if (/comerciante|mercador|merchant|trader/.test(t)) map.merchants = i;
-      });
-    }
-    return { table, map };
-  }
-  // extrai os 3 primeiros números de um texto (madeira, argila, ferro), aceitando "80.928"
-  function threeNums(txt) {
-    const m = (txt || "").match(/\d[\d.,]*\d|\d/g);
-    if (!m) return null;
-    const nums = m.map(num).filter(n => !isNaN(n));
-    if (nums.length < 3) return null;
-    return { wood: nums[0], stone: nums[1], iron: nums[2] };
-  }
-  function readRes(tr, map) {
-    // 1) por classe .res.wood/.stone/.iron (layout real da tela Produção do br142)
-    const woodEl = tr.querySelector("span.wood, .res.wood");
-    const stoneEl = tr.querySelector("span.stone, .res.stone");
-    const ironEl = tr.querySelector("span.iron, .res.iron");
-    if (woodEl && stoneEl && ironEl) {
-      return { wood: num(woodEl.textContent), stone: num(stoneEl.textContent), iron: num(ironEl.textContent) };
-    }
-    // 2) coluna única "Recursos" com 3 números
-    if (map.res != null && tr.children[map.res]) {
-      const r = threeNums(tr.children[map.res].textContent);
-      if (r) return r;
-    }
-    // 3) colunas separadas por índice
-    if (map.wood != null && map.stone != null && map.iron != null) {
-      return { wood: num(tr.children[map.wood].textContent), stone: num(tr.children[map.stone].textContent), iron: num(tr.children[map.iron].textContent) };
-    }
-    return null;
-  }
-  function readStorage(tr, map) {
-    if (map.storage == null || !tr.children[map.storage]) return null;
-    const val = num(tr.children[map.storage].textContent);
-    if (val > 0 && val <= 30 && WH_CAP[val]) return WH_CAP[val]; // caso mostre o nível
-    return val || null;
-  }
-  function readMerchants(tr, map) {
-    if (map.merchants == null || !tr.children[map.merchants]) return null;
-    const m = (tr.children[map.merchants].textContent || "").match(/(\d[\d.]*)/); // "66/110" -> 66
-    return m ? num(m[1]) : 0;
-  }
+  // ------------------------- LEITURA DA VISÃO GERAL (mobile + desktop) -------------------------
+  // Detecta mobile pela presença do #mobileHeader no documento buscado.
+  function isMobileDoc(doc) { return !!doc.querySelector("#mobileHeader, #mobile_header"); }
 
-  // Busca a overview forçando o layout DESKTOP (o mobile não tem tabela).
-  // Tenta várias formas até uma trazer a production_table.
-  async function fetchOverviewDoc(gid) {
-    const base = "/game.php?screen=overview_villages";
-    const urls = [
-      base + "&mode=prod&group=" + gid + "&page=-1&mobile=0",
-      base + "&mode=combined&group=" + gid + "&page=-1&mobile=0",
-      base + "&mode=prod&group=" + gid + "&page=-1",
-      base + "&mode=combined&group=" + gid + "&page=-1"
-    ];
-    for (const u of urls) {
-      let txt = "";
-      try {
-        const r = await fetch(origin + u, { credentials: "same-origin" });
-        txt = await r.text();
-        log("fetch " + u.slice(0, 62), r.status + " / " + txt.length + "b");
-      } catch (e) { log("erro fetch", e.message); continue; }
-      const doc = new DOMParser().parseFromString(txt, "text/html");
-      const { table } = findTableAndMap(doc);
-      const isMobile = /var\s+mobile\s*=\s*true/.test(txt) || /mobile\.[a-f0-9]+\.css/.test(txt);
-      log("  tabela? " + !!table + " | pagina mobile? " + isMobile);
-      if (table) { log("  -> OK, usando esta URL"); return doc; }
+  // Lê todas as aldeias de um grupo pela abordagem por CLASSES (funciona em
+  // mobile e desktop — só muda o prefixo "m" nos seletores de recurso).
+  // Baseado no Warehouse Balancer (Sophie "Shinko to Kuma").
+  function readVillagesFromDoc(doc) {
+    const $$ = sel => [...doc.querySelectorAll(sel)];
+    const mob = isMobileDoc(doc);
+    log("layout", mob ? "mobile" : "desktop");
+
+    const villagesEls = $$(".quickedit-vn");
+    let woodEls, clayEls, ironEls, whEls, farmEls, merchEls, pointsCells;
+
+    if (mob) {
+      woodEls = $$(".res.mwood, .warn_90.mwood, .warn.mwood");
+      clayEls = $$(".res.mstone, .warn_90.mstone, .warn.mstone");
+      ironEls = $$(".res.miron, .warn_90.miron, .warn.miron");
+      whEls   = $$(".mheader.ressources");
+      farmEls = $$(".header.population");
+      merchEls = $$(".trader_img").map(t => t.parentElement);
+      pointsCells = $$(".points-header");
+    } else {
+      woodEls = $$(".res.wood, .warn_90.wood, .warn.wood");
+      clayEls = $$(".res.stone, .warn_90.stone, .warn.stone");
+      ironEls = $$(".res.iron, .warn_90.iron, .warn.iron");
     }
-    return null;
+
+    log("contagens", { aldeias: villagesEls.length, wood: woodEls.length, clay: clayEls.length, iron: ironEls.length });
+
+    const villages = [];
+    for (let i = 0; i < villagesEls.length; i++) {
+      const el = villagesEls[i];
+      const id = el.dataset ? el.dataset.id : null;
+      const name = (el.innerText || el.textContent || "").trim();
+      const mm = name.match(/(\d{1,3})\|(\d{1,3})/);
+      if (!id || !mm) continue;
+
+      const wood = num((woodEls[i] || {}).textContent);
+      const stone = num((clayEls[i] || {}).textContent);
+      const iron = num((ironEls[i] || {}).textContent);
+
+      let storage = 0, merchants = 0, points = 0;
+      if (mob) {
+        if (whEls[i]) storage = num(whEls[i].parentElement ? whEls[i].parentElement.innerText : whEls[i].textContent);
+        if (merchEls[i]) { const t = (merchEls[i].innerText || "").match(/(\d[\d.]*)/); merchants = t ? num(t[1]) : 0; }
+        if (pointsCells[i]) { const kids = pointsCells[i].children; const last = kids.length ? kids[kids.length - 1] : pointsCells[i]; points = num(last.innerText || last.textContent); }
+      } else {
+        // desktop: as células seguem o elemento de ferro (mesma cadeia do original)
+        const ironCell = ironEls[i] ? ironEls[i].parentElement : null;
+        if (ironCell) {
+          const whCell = ironCell.nextElementSibling;
+          const merchCell = whCell ? whCell.nextElementSibling : null;
+          if (whCell) storage = num(whCell.innerText || whCell.textContent);
+          if (merchCell) { const t = (merchCell.innerText || "").match(/(\d+)\/(\d+)/); merchants = t ? num(t[1]) : 0; }
+        }
+        // pontos: célula anterior ao elemento de madeira
+        const woodCell = woodEls[i] ? woodEls[i].parentElement : null;
+        if (woodCell && woodCell.previousElementSibling) points = num(woodCell.previousElementSibling.innerText || woodCell.previousElementSibling.textContent);
+      }
+
+      villages.push({ id: +id, name: name.replace(/\s*\(\d+\|\d+\).*/, "").trim() || ("Aldeia " + id), x: +mm[1], y: +mm[2], wood, stone, iron, storage, merchants, points });
+    }
+    return villages;
   }
 
   async function readGroup(gid) {
     log("=== readGroup grupo " + gid + " ===");
-    const doc = await fetchOverviewDoc(gid);
-    if (!doc) { log("!! nenhuma URL trouxe tabela (layout mobile?)"); return { villages: [], missing: ["tabela"] }; }
-    const { table, map } = findTableAndMap(doc);
-    log("achou production_table?", !!table);
-    log("mapa de colunas", map);
-    if (!table) {
-      log("!! nenhuma tabela de aldeias encontrada");
-      return { villages: [], missing: ["tabela"] };
-    }
-    // linhas de aldeia = <tr> DENTRO da tabela, com link de aldeia E coordenada
-    const allTr = [...table.querySelectorAll("tr")];
-    const rows = allTr.filter(tr => tr.querySelector('a[href*="village="]') && /\d{1,3}\|\d{1,3}/.test(tr.textContent || ""));
-    log("linhas na tabela: total=" + allTr.length + " aldeias=" + rows.length);
-    const villages = [];
-    const missing = new Set();
-    if (map.res == null) missing.add("recursos(coluna)"); // recursos são lidos por classe; isto é só informativo
-    if (map.storage == null) missing.add("armazém");
-    if (map.merchants == null) missing.add("mercadores");
-    let firstLogged = false;
-    rows.forEach(tr => {
-      const link = tr.querySelector('a[href*="village="]');
-      const idm = link.href.match(/village=(\d+)/);
-      const mm = (tr.textContent || "").match(/(\d{1,3})\|(\d{1,3})/);
-      if (!idm || !mm) return;
-      // nome: usa o data-text da label quando existir (evita pegar "Edifício principal" etc.)
-      const label = tr.querySelector(".quickedit-label");
-      const name = (label && (label.getAttribute("data-text") || label.textContent) || link.textContent || "").trim().replace(/\s*\(\d+\|\d+\).*/, "");
-      const v = { id: +idm[1], name: name || ("Aldeia " + idm[1]), x: +mm[1], y: +mm[2] };
-      v.points = (map.points != null && tr.children[map.points]) ? num(tr.children[map.points].textContent) : 0;
-      const res = readRes(tr, map);
-      if (res) { v.wood = res.wood; v.stone = res.stone; v.iron = res.iron; }
-      else { v.wood = v.stone = v.iron = 0; }
-      v.storage = readStorage(tr, map) || 0;
-      const me = readMerchants(tr, map);
-      v.merchants = me == null ? 0 : me;
-      if (!firstLogged) { log("1ª aldeia lida", { nome: v.name, x: v.x, y: v.y, pts: v.points, w: v.wood, s: v.stone, i: v.iron, arm: v.storage, merc: v.merchants, res_ok: !!res }); firstLogged = true; }
-      villages.push(v);
-    });
+    const u = "/game.php?screen=overview_villages&mode=prod&group=" + gid + "&page=-1";
+    let txt = "";
+    try {
+      const r = await fetch(origin + u, { credentials: "same-origin" });
+      txt = await r.text();
+      log("fetch prod", r.status + " / " + txt.length + "b");
+    } catch (e) { log("erro fetch", e.message); return { villages: [], missing: ["fetch"] }; }
+    const doc = new DOMParser().parseFromString(txt, "text/html");
+    const villages = readVillagesFromDoc(doc);
     log("total de aldeias lidas: " + villages.length);
-    return { villages, missing: [...missing] };
+    if (villages.length && villages[0]) log("1ª aldeia", { nome: villages[0].name, x: villages[0].x, y: villages[0].y, w: villages[0].wood, s: villages[0].stone, i: villages[0].iron, arm: villages[0].storage, merc: villages[0].merchants, pts: villages[0].points });
+    const missing = [];
+    if (villages.length && villages.every(v => !v.storage)) missing.push("armazém");
+    if (villages.length && villages.every(v => !v.merchants)) missing.push("mercadores");
+    return { villages, missing };
   }
 
   // ------------------------- ALGORITMO -------------------------
