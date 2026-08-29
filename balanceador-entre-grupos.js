@@ -67,12 +67,11 @@
     return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
   }
 
-  // ------------------------- LOG DE DEBUG -------------------------
+  // ------------------------- LOG (silencioso) -------------------------
   const LOG = [];
   function log(msg, obj) {
-    const line = msg + (obj !== undefined ? " → " + (typeof obj === "object" ? JSON.stringify(obj) : String(obj)) : "");
-    LOG.push(line);
-    try { console.log("%c[Balanceador]", "color:#e5484d;font-weight:bold", msg, obj !== undefined ? obj : ""); } catch (e) {}
+    LOG.push(msg + (obj !== undefined ? " → " + (typeof obj === "object" ? JSON.stringify(obj) : String(obj)) : ""));
+    if (LOG.length > 200) LOG.shift();
   }
 
   const fetchDoc = async u => {
@@ -216,9 +215,36 @@
     return m ? num(m[1]) : 0;
   }
 
+  // Busca a overview forçando o layout DESKTOP (o mobile não tem tabela).
+  // Tenta várias formas até uma trazer a production_table.
+  async function fetchOverviewDoc(gid) {
+    const base = "/game.php?screen=overview_villages";
+    const urls = [
+      base + "&mode=prod&group=" + gid + "&page=-1&mobile=0",
+      base + "&mode=combined&group=" + gid + "&page=-1&mobile=0",
+      base + "&mode=prod&group=" + gid + "&page=-1",
+      base + "&mode=combined&group=" + gid + "&page=-1"
+    ];
+    for (const u of urls) {
+      let txt = "";
+      try {
+        const r = await fetch(origin + u, { credentials: "same-origin" });
+        txt = await r.text();
+        log("fetch " + u.slice(0, 62), r.status + " / " + txt.length + "b");
+      } catch (e) { log("erro fetch", e.message); continue; }
+      const doc = new DOMParser().parseFromString(txt, "text/html");
+      const { table } = findTableAndMap(doc);
+      const isMobile = /var\s+mobile\s*=\s*true/.test(txt) || /mobile\.[a-f0-9]+\.css/.test(txt);
+      log("  tabela? " + !!table + " | pagina mobile? " + isMobile);
+      if (table) { log("  -> OK, usando esta URL"); return doc; }
+    }
+    return null;
+  }
+
   async function readGroup(gid) {
     log("=== readGroup grupo " + gid + " ===");
-    const doc = await fetchDoc("/game.php?screen=overview_villages&mode=prod&group=" + gid + "&page=-1");
+    const doc = await fetchOverviewDoc(gid);
+    if (!doc) { log("!! nenhuma URL trouxe tabela (layout mobile?)"); return { villages: [], missing: ["tabela"] }; }
     const { table, map } = findTableAndMap(doc);
     log("achou production_table?", !!table);
     log("mapa de colunas", map);
@@ -482,8 +508,7 @@
       '<div style="padding:12px 14px;color:#d8c3a6;font-size:13px">Origem <b>' + srcInfo.villages.length + '</b> · Destino <b>' + dstInfo.villages.length + '</b> · <b>' + sends.length + '</b> envio(s) · <b>' + totMerch + '</b> mercadores<br>Total: 🪵 ' + fmt(tot.wood) + "  🧱 " + fmt(tot.stone) + "  ⚙️ " + fmt(tot.iron) + '</div>' +
       '<div style="padding:0 14px">' + sendAllBtn + '</div>' +
       cards + emptyMsg +
-      '<div style="padding:12px 14px;color:#b98;font-size:11px">Cada "Enviar" dispara na hora e some da lista quando confirmado. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%. ⏱ = tempo dos mercadores.</div>' +
-      '<div style="padding:0 14px 14px"><button id="bg-showlog" style="padding:8px 12px;background:#3a2716;color:#f0e6d8;border:1px solid #7a5230;border-radius:6px;cursor:pointer;font-size:12px">Ver debug dos envios</button></div>';
+      '<div style="padding:12px 14px;color:#b98;font-size:11px">Cada "Enviar" dispara na hora e some da lista quando confirmado. Destinos até ' + CFG.maxFillPercent + '% do armazém; origens mantêm ' + CFG.keepPercent + '%. ⏱ = tempo dos mercadores.</div>';
 
     // liga os botões
     const status = i => w.querySelector('.bg-status[data-si="' + i + '"]');
@@ -529,8 +554,6 @@
       all.disabled = false;
       refreshCount();
     };
-    const showlog = w.querySelector("#bg-showlog");
-    if (showlog) showlog.onclick = () => showDebug();
   }
 
   // ------------------------- EXECUÇÃO -------------------------
