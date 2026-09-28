@@ -22,6 +22,14 @@
   // unidades defensivas que o script controla (chave interna do jogo)
   const UNITS = ["spear", "sword", "archer", "heavy", "spy", "knight", "catapult"];
   const NAMES = { spear: "Lanceiro", sword: "Espada", archer: "Arco", heavy: "Cav. pesada", spy: "Explorador", knight: "Paladino", catapult: "Catapulta" };
+  // limites iniciais sugeridos por unidade (máximo a tirar de cada aldeia)
+  const DEFAULT_MAX = { spear: 600, sword: 300, archer: 600, heavy: 200, spy: 0, knight: 0, catapult: 0 };
+  // ID da aldeia de destino (alvo) — vem da URL (target=) ou do game_data
+  function targetVillageId() {
+    const m = location.href.match(/[?&]target=(\d+)/);
+    if (m) return m[1];
+    try { return String(window.game_data.village.id); } catch (e) { return null; }
+  }
 
   const doc = (window.frames.length > 0 && window.main) ? window.main.document : document;
   const $$ = (sel, root) => [...(root || doc).querySelectorAll(sel)];
@@ -151,17 +159,59 @@
   function panel() {
     document.getElementById("apm-panel")?.remove();
     const w = document.createElement("div"); w.id = "apm-panel";
-    w.style.cssText = "position:fixed;left:50%;transform:translateX(-50%);bottom:0;z-index:2147483647;width:min(680px,100vw);max-height:92vh;overflow:auto;background:#241811;color:#f0e6d8;border:2px solid #7a5230;border-bottom:none;border-radius:12px 12px 0 0;font:15px/1.5 Verdana,Arial,sans-serif;box-shadow:0 -8px 40px rgba(0,0,0,.6);-webkit-text-size-adjust:100%";
+    w.style.cssText = "position:fixed;left:0;top:0;bottom:0;z-index:2147483647;width:min(340px,88vw);max-height:100vh;overflow:auto;background:#241811;color:#f0e6d8;border-right:2px solid #7a5230;border-radius:0;font:14px/1.45 Verdana,Arial,sans-serif;box-shadow:6px 0 30px rgba(0,0,0,.55);-webkit-text-size-adjust:100%";
     document.body.appendChild(w); return w;
   }
   const val = id => { const el = document.getElementById(id); return el ? num(el.value) : 0; };
 
-  function render() {
+  // Lê as tropas que a aldeia de DESTINO já tem (próprias + apoios), somando
+  // o que está lá + o que está a caminho, para descontar do alvo.
+  // Fonte: tela de tropas do destino (screen=place&mode=units ou overview do destino).
+  async function readTargetTroops(tid) {
+    const have = {}; UNITS.forEach(u => have[u] = 0);
+    if (!tid) return { have, ok: false };
+    // a praça do destino (mode=units) mostra "na aldeia" + "a caminho" por unidade
+    try {
+      const r = await fetch(location.origin + "/game.php?village=" + tid + "&screen=place&mode=units", { credentials: "same-origin" });
+      const doc2 = new DOMParser().parseFromString(await r.text(), "text/html");
+      // procura uma tabela de tropas com colunas por unidade; soma "own" + "support"
+      // padrão: células com data-unit ou classe unit_link_<u>, e linhas "na aldeia"/"total"
+      let found = false;
+      UNITS.forEach(u => {
+        // tenta várias formas de achar o total daquela unidade no destino
+        const cells = [...doc2.querySelectorAll('[data-unit="' + u + '"], .unit-item-' + u + ', td.unit-item.' + u)];
+        // fallback: a tabela units_table tem colunas por unidade em ordem fixa
+        if (cells.length) { cells.forEach(c => { const n = num(c.getAttribute("data-count") || c.textContent); if (n) have[u] = Math.max(have[u], n); }); found = true; }
+      });
+      // fallback robusto: tabela #units_table com linha "total" (own+support)
+      if (!found) {
+        const table = doc2.querySelector("#units_table, table.vis");
+        if (table) {
+          // mapeia colunas pelo header (ícones de unidade) e pega a linha "total"/"na aldeia"
+          const heads = [...table.querySelectorAll("thead th, tr th")];
+          const colOf = {};
+          heads.forEach((th, i) => { const cls = (th.innerHTML || ""); UNITS.forEach(u => { if (new RegExp("unit_" + u + "\\b|/" + u + "\\.").test(cls) || (th.querySelector && th.querySelector('img[src*="' + u + '"]'))) colOf[u] = i; }); });
+          const rowsT = [...table.querySelectorAll("tbody tr, tr")];
+          // linha cujo primeiro td diz "no local"/"total"/"na aldeia" — somamos própria+apoio
+          rowsT.forEach(tr => {
+            const label = (tr.children[0] ? tr.children[0].textContent : "").toLowerCase();
+            if (/local|aldeia|total|própri|apoio|support/.test(label)) {
+              UNITS.forEach(u => { if (colOf[u] != null && tr.children[colOf[u]]) { const n = num(tr.children[colOf[u]].textContent); have[u] += n; } });
+              found = true;
+            }
+          });
+        }
+      }
+      return { have, ok: found };
+    } catch (e) { return { have, ok: false }; }
+  }
+
+  async function render() {
     const rows = findVillageRows();
     const w = panel();
 
     if (!rows.length) {
-      w.innerHTML = header() + '<div style="padding:16px;color:#ffb4b4">Não achei os campos de tropa nesta tela. Abra a <b>Praça de reunião → Chamar apoio</b> (screen=place&mode=call) e rode de novo.</div>';
+      w.innerHTML = header() + '<div style="padding:16px;color:#ffb4b4">Não achei os campos de tropa nesta tela. Abra a tela <b>Enviar apoio em massa</b> e rode de novo.</div>';
       return;
     }
 
@@ -169,57 +219,73 @@
     const totalAvail = {}; UNITS.forEach(u => totalAvail[u] = 0);
     rows.forEach(r => UNITS.forEach(u => totalAvail[u] += unitAvailable(r, u)));
 
+    // lê o que a aldeia de destino JÁ TEM (próprias + a caminho)
+    const tid = targetVillageId();
+    const { have, ok: haveOk } = await readTargetTroops(tid);
+
     const targetInputs = UNITS.map(u =>
-      '<div style="flex:1;min-width:88px"><label style="' + LBL + '">' + NAMES[u] + '<br><span style="color:#8a7">disp. ' + fmt(totalAvail[u]) + '</span></label>' +
+      '<div style="flex:1;min-width:96px"><label style="' + LBL + '">' + NAMES[u] +
+      (haveOk ? '<br><span style="color:#8ad">tem ' + fmt(have[u]) + '</span>' : '') +
+      '<br><span style="color:#8a7">disp. ' + fmt(totalAvail[u]) + '</span></label>' +
       '<input id="apm-t-' + u + '" inputmode="numeric" placeholder="0" style="' + INP + '"></div>'
     ).join("");
 
     const maxInputs = UNITS.map(u =>
-      '<div style="flex:1;min-width:88px"><label style="' + LBL + '">' + NAMES[u] + '</label>' +
-      '<input id="apm-m-' + u + '" inputmode="numeric" placeholder="0 = sem limite" style="' + INP + '"></div>'
+      '<div style="flex:1;min-width:96px"><label style="' + LBL + '">' + NAMES[u] + '</label>' +
+      '<input id="apm-m-' + u + '" inputmode="numeric" value="' + (DEFAULT_MAX[u] || "") + '" placeholder="0 = sem limite" style="' + INP + '"></div>'
     ).join("");
 
+    const haveNote = haveOk
+      ? '<div style="padding:0 16px 4px;color:#8ad;font-size:12px">✓ Li as tropas já presentes no destino — o alvo será descontado do que já existe.</div>'
+      : '<div style="padding:0 16px 4px;color:#e8c98a;font-size:12px">⚠ Não consegui ler as tropas do destino; o alvo será tratado como total a enviar. (me avise pra ajustar)</div>';
+
     w.innerHTML = header() +
-      '<div style="padding:14px 16px;color:#d8c3a6;font-size:13px;border-bottom:1px solid #4a331d"><b>' + rows.length + '</b> aldeia(s) disponível(is) nesta tela.</div>' +
-      '<div style="padding:14px 16px">' +
-        '<div style="color:#9fe6b8;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">1 · Quantas tropas quero na aldeia (alvo total)</div>' +
+      '<div style="padding:12px 16px;color:#d8c3a6;font-size:13px;border-bottom:1px solid #4a331d"><b>' + rows.length + '</b> aldeia(s) de origem nesta tela.</div>' +
+      haveNote +
+      '<div style="padding:12px 16px">' +
+        '<div style="color:#9fe6b8;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin-bottom:8px">1 · Alvo TOTAL de tropas na aldeia</div>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap">' + targetInputs + '</div>' +
-        '<div style="color:#e8c98a;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:16px 0 8px">2 · Máximo a usar de CADA aldeia (0 = sem limite)</div>' +
+        '<div style="color:#e8c98a;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:16px 0 8px">2 · Máximo por aldeia de origem</div>' +
         '<div style="display:flex;gap:8px;flex-wrap:wrap">' + maxInputs + '</div>' +
         '<div id="apm-msg" style="color:#ffd9a0;font-size:13px;margin-top:12px"></div>' +
         '<div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">' +
-          '<button id="apm-fill" style="' + BTN + ';flex:2;min-width:180px">Preencher campos</button>' +
-          '<button id="apm-clear" style="' + BTN + ';flex:1;min-width:120px;background:#5a3a2a">Limpar</button>' +
+          '<button id="apm-fill" style="' + BTN + ';flex:2;min-width:140px">Preencher</button>' +
+          '<button id="apm-clear" style="' + BTN + ';flex:1;min-width:90px;background:#5a3a2a">Limpar</button>' +
         '</div>' +
-        '<div style="color:#b98;font-size:11px;margin-top:10px">O script só preenche os campos, distribuindo de forma equilibrada entre as aldeias (proporcional ao que cada uma tem, respeitando o máximo). Você confere e clica em enviar no jogo.</div>' +
+        '<div style="color:#b98;font-size:11px;margin-top:10px">Preenche só a diferença (alvo − o que o destino já tem), distribuindo entre as origens proporcional ao que cada uma tem, respeitando o máximo. Você confere e clica em "Enviar apoio" no jogo.</div>' +
       '</div>' +
       '<div id="apm-result"></div>';
 
     document.getElementById("apm-fill").onclick = () => {
-      const targets = {}; UNITS.forEach(u => targets[u] = val("apm-t-" + u));
+      const rawTargets = {}; UNITS.forEach(u => rawTargets[u] = val("apm-t-" + u));
       const maxPer = {}; UNITS.forEach(u => maxPer[u] = val("apm-m-" + u));
-      const totalTarget = UNITS.reduce((s, u) => s + targets[u], 0);
+      const totalTarget = UNITS.reduce((s, u) => s + rawTargets[u], 0);
       const msg = document.getElementById("apm-msg");
       if (totalTarget <= 0) { msg.textContent = "Defina ao menos um alvo de tropa."; return; }
 
-      const { assign } = distribute(rows, targets, maxPer);
-      const usedUnits = UNITS.filter(u => targets[u] > 0);
+      // desconta o que o destino já tem → só envia a diferença
+      const needTargets = {};
+      UNITS.forEach(u => needTargets[u] = Math.max(0, rawTargets[u] - (haveOk ? have[u] : 0)));
+
+      const { assign } = distribute(rows, needTargets, maxPer);
+      const usedUnits = UNITS.filter(u => needTargets[u] > 0);
       const filled = fillFields(rows, assign, usedUnits);
 
-      // resumo do que foi alocado vs alvo
       const got = {}; UNITS.forEach(u => got[u] = 0);
       assign.forEach(a => UNITS.forEach(u => got[u] += a[u]));
-      let resHtml = '<div style="padding:8px 16px 16px"><div style="color:#9fe6b8;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:8px 0">Resultado (alocado / alvo)</div><table style="width:100%;border-collapse:collapse;font-size:13px">';
+      let resHtml = '<div style="padding:8px 16px 16px"><div style="color:#9fe6b8;font-size:12px;text-transform:uppercase;letter-spacing:.06em;margin:8px 0">Resultado</div><table style="width:100%;border-collapse:collapse;font-size:13px">';
+      resHtml += '<tr style="color:#b98"><td style="padding:3px 4px">Tropa</td><td style="padding:3px 4px;text-align:right">enviar/faltava</td><td></td></tr>';
       UNITS.forEach(u => {
-        if (!targets[u]) return;
-        const falta = targets[u] - got[u];
-        resHtml += '<tr style="border-top:1px solid #4a331d"><td style="padding:5px 4px">' + NAMES[u] + '</td>' +
-          '<td style="padding:5px 4px;text-align:right;font-family:monospace">' + fmt(got[u]) + ' / ' + fmt(targets[u]) + '</td>' +
-          '<td style="padding:5px 4px;text-align:right;color:' + (falta > 0 ? "#e5877d" : "#9fe6b8") + '">' + (falta > 0 ? "faltam " + fmt(falta) : "ok ✓") + '</td></tr>';
+        if (!rawTargets[u]) return;
+        const need = needTargets[u];
+        const falta = need - got[u];
+        resHtml += '<tr style="border-top:1px solid #4a331d"><td style="padding:5px 4px">' + NAMES[u] + (haveOk ? ' <span style="color:#8ad;font-size:11px">(tem ' + fmt(have[u]) + ')</span>' : '') + '</td>' +
+          '<td style="padding:5px 4px;text-align:right;font-family:monospace">' + fmt(got[u]) + ' / ' + fmt(need) + '</td>' +
+          '<td style="padding:5px 4px;text-align:right;color:' + (falta > 0 ? "#e5877d" : "#9fe6b8") + '">' + (need <= 0 ? "já ok" : (falta > 0 ? "faltam " + fmt(falta) : "✓")) + '</td></tr>';
       });
       resHtml += '</table></div>';
       document.getElementById("apm-result").innerHTML = resHtml;
-      msg.innerHTML = '<span style="color:#9fe6b8">✓ ' + filled + ' campo(s) preenchido(s) em ' + rows.length + ' aldeia(s). Confira e clique em enviar no jogo.</span>';
+      msg.innerHTML = '<span style="color:#9fe6b8">✓ ' + filled + ' campo(s) preenchido(s). Confira e clique em "Enviar apoio".</span>';
     };
     document.getElementById("apm-clear").onclick = () => { clearFields(rows); document.getElementById("apm-result").innerHTML = ""; document.getElementById("apm-msg").innerHTML = '<span style="color:#b98">Campos limpos.</span>'; };
   }
